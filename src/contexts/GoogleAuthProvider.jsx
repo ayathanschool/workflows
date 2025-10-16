@@ -18,6 +18,15 @@ function InnerAuthProvider({ children }) {
 	const [loading, setLoading] = useState(false);
 	const [error, setError] = useState(null);
 
+	// Compute redirect URI that works on GitHub Pages subpaths (e.g., /workflows)
+	// Vite sets import.meta.env.BASE_URL to the configured base ("/" or "/repo/")
+	const basePath = (import.meta.env.BASE_URL || '/');
+	const redirectUri = useMemo(() => {
+		// If base is just "/", redirect to origin. Otherwise include base path without trailing slash
+		const normalizedBase = basePath === '/' ? '' : basePath.replace(/\/$/, '');
+		return `${window.location.origin}${normalizedBase}`;
+	}, [basePath]);
+
 	// Restore session from localStorage
 	useEffect(() => {
 		try {
@@ -130,7 +139,7 @@ function InnerAuthProvider({ children }) {
 		// Add custom options that won't trigger COOP restrictions
 		select_account: true,
 		prompt: 'select_account',
-		redirect_uri: window.location.origin,
+		redirect_uri: redirectUri,
 		auto_select: false,
 		// Using the newer window.open options with specific target name
 		// to prevent COOP from blocking window.closed checks
