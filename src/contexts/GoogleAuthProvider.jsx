@@ -22,9 +22,8 @@ function InnerAuthProvider({ children }) {
 	// Vite sets import.meta.env.BASE_URL to the configured base ("/" or "/repo/")
 	const basePath = (import.meta.env.BASE_URL || '/');
 	const redirectUri = useMemo(() => {
-		// If base is just "/", redirect to origin. Otherwise include base path without trailing slash
-		const normalizedBase = basePath === '/' ? '' : basePath.replace(/\/$/, '');
-		return `${window.location.origin}${normalizedBase}`;
+		// Use the basePath as provided by Vite (includes trailing slash for GitHub Pages like "/workflows/")
+		return `${window.location.origin}${basePath}`;
 	}, [basePath]);
 
 	// Restore session from localStorage
