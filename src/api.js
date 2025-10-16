@@ -105,10 +105,11 @@ async function postJSON(url, payload) {
   const body = JSON.stringify(payload);
   try {
   devLog('POST', url, payload);
+    // Use text/plain to avoid CORS preflight with Apps Script
     const res = await fetch(url, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'text/plain;charset=utf-8'
       },
       body
     })
@@ -161,18 +162,22 @@ export async function googleLogin(googleAuthInfo) {
     devLog('Sending Google auth info to backend (POST)');
     return await postJSON(`${BASE_URL}?action=googleLogin`, googleAuthInfo);
   } catch (err) {
-    // If POST 404, attempt GET fallback (legacy / troubleshooting scenario)
-    if (String(err.message||'').includes('HTTP 404')) {
-      devLog('googleLogin POST 404, attempting GET fallback');
-      try {
-        devLog('Sending Google auth info via GET fallback');
-        // For GET, just send the email as the main identifier
-        return await getJSON(`${BASE_URL}?action=googleLogin&email=${encodeURIComponent(googleAuthInfo.email)}`);
-      } catch (err2) {
-        console.error('Both POST and GET Google login attempts failed:', 
-                      { postError: err.message, getError: err2.message });
-        throw new Error(`Google login failed. Please ensure your Google Apps Script deployment is up to date and has the doPost handler. If the problem persists, try clearing your browser cache.`);
+    // If POST fails for any reason (CORS/preflight/network), attempt GET fallback
+    devLog('googleLogin POST failed, attempting GET fallback');
+    try {
+      // For GET, just send the email as the main identifier
+      if (!googleAuthInfo?.email) throw err; // can't fallback without email
+      devLog('Sending Google auth info via GET fallback');
+      return await getJSON(`${BASE_URL}?action=googleLogin&email=${encodeURIComponent(googleAuthInfo.email)}`);
+    } catch (err2) {
+      console.error('Both POST and GET Google login attempts failed:', 
+                    { postError: err?.message, getError: err2?.message });
+      // Improved error messages
+      let errorMessage = String(err?.message || '');
+      if (errorMessage.includes('Invalid Google token')) {
+        throw new Error('Authentication failed. Your Google token could not be verified. Please sign in again.');
       }
+      throw new Error(`Google login failed. Please ensure your Apps Script Web App is deployed (doPost handler active) and that your browser allows third-party cookies/popups.`);
     }
     
     // Improved error message for common issues
