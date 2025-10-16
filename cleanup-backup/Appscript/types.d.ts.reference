@@ -1,0 +1,72 @@
+/**
+ * TypeScript definitions for SchoolFlow user management
+ * These types help provide better IDE support and code quality checks
+ */
+
+/**
+ * User data structure
+ */
+// Define User as a class instead of an interface for GAS compatibility
+var User = {
+  email: "",
+  name: "",
+  password: "",
+  roles: "",
+  classes: "",
+  subjects: "",
+  classTeacherFor: ""
+};
+
+/**
+ * Response format for API functions
+ */
+interface ApiResponse {
+  success: boolean;
+  message?: string;
+  error?: string;
+  [key: string]: any;
+}
+
+/**
+ * Role validation result
+ */
+interface RoleValidationResult {
+  valid: boolean;
+  roles: string[];
+  invalidRoles?: string[];
+}
+
+/**
+ * Type declarations for helper functions
+ */
+declare function _getSheet(name: string): GoogleAppsScript.Spreadsheet.Sheet;
+declare function _headers(sh: GoogleAppsScript.Spreadsheet.Sheet): string[];
+declare function _rows(sh: GoogleAppsScript.Spreadsheet.Sheet): any[][];
+declare function _indexByHeader(row: any[], headers: string[]): Record<string, any>;
+declare function _bootstrapSheets(): void;
+declare function _hashPassword(password: string): string;
+
+/**
+ * Type declarations for role utility functions
+ */
+declare const VALID_ROLES: string[];
+declare function validateRoles(rolesString: string): RoleValidationResult;
+declare function hasRole(userRoles: string | string[], roleToCheck: string): boolean;
+declare function getRoleLabels(roles: string | string[]): string[];
+
+// Exported function signatures
+declare function addUser(
+  email: string, 
+  name: string, 
+  password: string, 
+  roles?: string, 
+  classes?: string, 
+  subjects?: string, 
+  classTeacherFor?: string
+): ApiResponse;
+
+declare function updateUserPassword(email: string, newPassword: string): ApiResponse;
+declare function listAllUsers(): User[];
+declare function removeUser(email: string): ApiResponse;
+declare function createSampleUsers(): ApiResponse;
+declare function testLogin(email: string, password: string): ApiResponse;

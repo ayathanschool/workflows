@@ -1,0 +1,2460 @@
+/**
+ * ====== CONFIG ======
+ * Replace with your Spreadsheet ID.
+ */
+const SPREADSHEET_ID = '13wCXKAslpW3JYUguu5R-sWrjcThp1JWIJscwkyMeC8U';
+
+/**
+ * ====== Helpers ======
+ */
+function _ss() {
+  try {
+    return SpreadsheetApp.openById(SPREADSHEET_ID);
+  } catch (err) {
+    throw new Error(`Unable to open spreadsheet with ID ${SPREADSHEET_ID}: ${err && err.message ? err.message : err}`);
+  }
+}
+
+function _getSheet(name) {
+  const ss = _ss();
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  return sh;
+}
+
+function _headers(sh) {
+  const range = sh.getRange(1,1,1,sh.getLastColumn() || 1);
+  const values = range.getValues()[0];
+  return values.map(v => String(v||'').trim());
+}
+
+function _ensureHeaders(sh, cols) {
+  const h = _headers(sh);
+  if (h.filter(Boolean).length === 0) {
+    sh.getRange(1,1,1,cols.length).setValues([cols]);
+  }
+}
+
+function _rows(sh) {
+  const lastRow = sh.getLastRow();
+  const lastCol = Math.max(sh.getLastColumn(), 1);
+  if (lastRow < 2) return [];
+  return sh.getRange(2,1,lastRow-2+1,lastCol).getValues();
+}
+
+function _indexByHeader(row, headers) {
+  const obj = {};
+  headers.forEach((h, i) => obj[h] = row[i]);
+  return obj;
+}
+
+function _uuid() {
+  return Utilities.getUuid();
+}
+
+function _todayISO() {
+  const tz = Session.getScriptTimeZone();
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const dd = String(d.getDate()).padStart(2,'0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function _dayName(isoDate) {
+  // Use Utilities.formatDate to compute the day name in the script's timezone
+  try {
+    const d = new Date(isoDate + 'T00:00:00');
+    return Utilities.formatDate(d, Session.getScriptTimeZone(), 'EEEE');
+  } catch (e) {
+    // Fallback: attempt a simple Date conversion
+    const d = new Date(isoDate + 'T00:00:00');
+    return d.toLocaleDateString('en-US', { weekday: 'long' });
+  }
+}
+
+/**
+ * Normalize a day name (or abbreviation) to the full English weekday name
+ * e.g. 'fri', 'FRIDAY', ' friday ' -> 'Friday'. Returns empty string for falsy input.
+ */
+function _normalizeDayName(input) {
+  if (!input && input !== 0) return '';
+  const s = String(input).trim().toLowerCase();
+  if (!s) return '';
+  const map = {
+    'mon': 'Monday', 'monday': 'Monday',
+    'tue': 'Tuesday', 'tues': 'Tuesday', 'tuesday': 'Tuesday',
+    'wed': 'Wednesday', 'weds': 'Wednesday', 'wednesday': 'Wednesday',
+    'thu': 'Thursday', 'thurs': 'Thursday', 'thursday': 'Thursday',
+    'fri': 'Friday', 'friday': 'Friday',
+    'sat': 'Saturday', 'saturday': 'Saturday',
+    'sun': 'Sunday', 'sunday': 'Sunday'
+  };
+  if (map[s]) return map[s];
+  // As a fallback, capitalize first letter of trimmed string
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/**
+ * Normalize any date-like value to ISO yyyy-MM-dd in GMT.
+ * Falls back to string if parsing fails.
+ */
+function _isoDateString(val) {
+  try {
+    if (!val) return '';
+    var d = (val instanceof Date) ? val : new Date(val);
+    if (isNaN(d.getTime())) return String(val || '');
+    return Utilities.formatDate(d, 'GMT', 'yyyy-MM-dd');
+  } catch (e) {
+    return String(val || '');
+  }
+}
+
+/**
+ * Determine a grade standard group string for a class name.
+ * Examples: "Std 3A" -> "Std 1-4", "10A" -> "Std 9-12".
+ * This is a simple heuristic so grade boundaries lookup can select
+ * the appropriate group. Returns empty string if unknown.
+ */
+function _standardGroup(cls) {
+  if (!cls) return '';
+  try {
+    // extract the first number found in the class string
+    const m = String(cls).match(/(\d+)/);
+    if (!m) return '';
+    const n = Number(m[1]);
+    if (isNaN(n)) return '';
+    if (n <= 4) return 'Std 1-4';
+    if (n <= 8) return 'Std 5-8';
+    return 'Std 9-12';
+  } catch (e) {
+    return '';
+  }
+}
+
+function _respond(obj, status) {
+  // Try to use the CORS helper if available
+  try {
+    if (typeof jsonResponse === 'function') {
+      return jsonResponse(obj);
+    }
+  } catch (e) {
+    // If jsonResponse isn't defined yet, fall back to basic response
+    Logger.log("CORS helper not available: " + e);
+  }
+  
+  // Default response without CORS headers
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function _parsePost(e) {
+  try {
+    if (e.postData && e.postData.contents) {
+      return JSON.parse(e.postData.contents);
+    }
+  } catch (err) {}
+  return {};
+}
+
+/**
+ * ====== Data Model ======
+ * Sheets and expected columns
+ */
+const SHEETS = {
+  // NOTE: Added 'password' as third column to align with UserManagement.gs addUser() logic
+  Users: ['email','name','password','roles','classes','subjects','classTeacherFor'],
+  // Settings: simple key/value configuration used by the frontend (e.g., lessonPlanningDay)
+  // Example rows:
+  //   key                | value
+  //   lessonPlanningDay  | Friday
+  //   allowNextWeekOnly  | true
+  //   periodTimes        | [{"period":1,"start":"08:30","end":"09:15"}, ...]
+  Settings: ['key','value'],
+  // Timetable now uses a weekly repeating schedule.  Each row represents
+  // a period on a particular day of the week for a specific class and teacher.
+  // Columns: class – the class name; dayOfWeek – the day name (e.g. Monday);
+  // period – the period number; subject – subject taught; teacherEmail – email
+  // address used to match against logged‑in teacher; teacherName – optional
+  // display name for reference.  When computing weekly timetables we map the
+  // upcoming seven calendar dates to their dayOfWeek and return matching rows.
+  Timetable: ['class','dayOfWeek','period','subject','teacherEmail','teacherName'],
+  Schemes: ['schemeId','teacherEmail','teacherName','class','subject','term','unit','chapter','month','noOfSessions','status','createdAt'],
+  LessonPlans: ['lpId','teacherEmail','teacherName','class','subject','chapter','session','objectives','activities','status','reviewerRemarks','date','createdAt'],
+  DailyReports: ['date','teacherEmail','teacherName','class','subject','period','planType','lessonPlanId','chapter','objectives','activities','completed','notes','createdAt'],
+  Substitutions: ['date','period','class','absentTeacher','regularSubject','substituteTeacher','substituteSubject','note','createdAt'],
+  CalendarEvents: ['eventId','userEmail','title','startTime','endTime','class','subject','notes','type','color','allDay','createdAt']
+  ,
+  // Exams: metadata for each exam created by the headmaster or authorized staff.
+  // Columns: examId – unique ID; creatorEmail – the email of the user who created
+  //   the exam; creatorName – the name of the creator; class – the class for which
+  //   the exam is conducted; subject – the subject; examType – e.g. Midterm,
+  //   Final, Quiz; internalMax – maximum marks for the internal component;
+  //   externalMax – maximum marks for the external component; totalMax – the
+  //   total marks (internalMax + externalMax); date – the exam date; createdAt –
+  //   timestamp of record creation.
+  Exams: ['examId','creatorEmail','creatorName','class','subject','examType','internalMax','externalMax','totalMax','date','createdAt'],
+  // ExamMarks: stores individual student marks for a given exam.  Columns:
+  //   examId – reference to Exams.examId; class – class name; subject – subject;
+  //   teacherEmail – email of the teacher submitting marks; teacherName – their name;
+  //   admNo – student admission number; studentName – student name;
+  //   internal – internal marks scored; external – external marks scored;
+  //   total – computed total marks; createdAt – timestamp of record creation.
+  ExamMarks: ['examId','class','subject','teacherEmail','teacherName','admNo','studentName','internal','external','total','createdAt']
+  ,
+  // Students: a master list of students with their admission number, name, class
+  // assignment and optional contact details.  This sheet is used to populate
+  // class rosters and performance reports.
+  Students: ['admNo','name','class','email','parentContact'],
+  // GradeTypes: defines exam grading schemes.  Each row specifies the exam type
+  // and the maximum internal and external marks as well as the computed total.
+  GradeTypes: ['examType','internalMax','externalMax','totalMax'],
+  // Attendance: daily attendance records for each student.  Columns store the
+  // date, class, student admission number and name, present/absent status,
+  // and the teacher who recorded the attendance.
+  Attendance: ['date','class','admNo','studentName','status','teacherEmail','teacherName','createdAt']
+  ,
+  // GradeBoundaries: defines percentage ranges for letter grades per standard group.
+  // Each row specifies the standardGroup (e.g. "Std 1-4"), the grade label (e.g. "A"),
+  // and the minimum and maximum percentages for that grade.  These ranges are used
+  // when computing exam grades from raw marks.
+  GradeBoundaries: ['standardGroup','grade','minPercentage','maxPercentage']
+};
+
+/**
+ * Ensure all tabs exist with headers
+ */
+function _bootstrapSheets() {
+  Object.keys(SHEETS).forEach(name => {
+    const sh = _getSheet(name);
+    _ensureHeaders(sh, SHEETS[name]);
+  });
+}
+
+/**
+ * ====== Public Web App ======
+ */
+function doGet(e) {
+  const action = (e.parameter.action || '').trim();
+  try {
+    Logger.log("Handling GET request for action: " + action);
+    _bootstrapSheets();
+    
+    if (action === 'ping') {
+      // Use jsonResponse directly if available
+      try {
+        if (typeof jsonResponse === 'function') {
+          return jsonResponse({ ok: true, now: new Date().toISOString() });
+        }
+      } catch (e) {
+        // Fall back to _respond if jsonResponse isn't available
+      }
+      return _respond({ ok: true, now: new Date().toISOString() });
+    }
+
+    if (action === 'login') {
+      const email = (e.parameter.email || '').toLowerCase().trim();
+      const password = (e.parameter.password || '').trim();
+      const sh = _getSheet('Users');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers));
+      const found = list.find(u => String(u.email||'').toLowerCase() === email);
+      if (!found) return _respond({ error: 'User not found' });
+      
+      // Verify password (you can add hashing here for security)
+      if (password && String(found.password || '') !== '') {
+        // Hash the input password to compare with stored hash
+        const hashedInput = Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, password));
+        if (hashedInput !== String(found.password || '')) {
+          return _respond({ error: 'Invalid password' });
+        }
+      }
+      // Normalize role, classes and subjects.  Support both lowercase
+      // field names (roles, classes, subjects) and the singular/Title case
+      // versions used in some spreadsheets (Role, Class, Classes, Subject, Subjects).
+      const roleStr = (found.roles || found.role || '').toString();
+      const roles = roleStr.split(',').map(s => s.trim()).filter(Boolean);
+      const classStr = (found.classes || found.Class || found.Classes || '').toString();
+      const classes = classStr.split(',').map(s => s.trim()).filter(Boolean);
+      const subjStr = (found.subjects || found.Subject || found.Subjects || '').toString();
+      const subjects = subjStr.split(',').map(s => s.trim()).filter(Boolean);
+      const classTeacherFor = found.classTeacherFor || found['Class Teacher For'] || '';
+      return _respond({ 
+        name: found.name || '',
+        email: found.email || '',
+        roles,
+        classes,
+        subjects,
+        classTeacherFor
+      });
+    }
+    
+    // Fallback GET handler for googleLogin (primarily for troubleshooting / legacy)
+    if (action === 'googleLogin') {
+      // Handle ID token authentication
+      if (e.parameter.idToken) {
+        return _handleGoogleLogin({ idToken: e.parameter.idToken });
+      }
+      // Handle email-based authentication
+      else if (e.parameter.email) {
+        Logger.log("Handling googleLogin via GET with email: " + e.parameter.email);
+        return _handleGoogleLogin({ 
+          email: e.parameter.email,
+          google_id: e.parameter.google_id || 'email_auth', // Placeholder for email-only auth
+          name: e.parameter.name || '',
+          picture: e.parameter.picture || ''
+        });
+      }
+      else {
+        return _respond({ error: 'Missing idToken or email parameter' });
+      }
+    }
+
+    // Fallback GET handler for googleLogin (primarily for troubleshooting / legacy).
+    // Prefer POST for security, but allow GET with idToken parameter so the
+    // client can retry when POST returns 404 (e.g. stale deployment without doPost).
+    if (action === 'googleLogin' && e.parameter.idToken) {
+      return _handleGoogleLogin({ idToken: e.parameter.idToken });
+    }
+
+    if (action === 'getTeacherWeeklyTimetable') {
+      // Weekly timetable: map the upcoming 7 calendar days to their day names
+      // and return periods based on the dayOfWeek column.  Because the timetable
+      // repeats weekly, we do not store specific dates in the sheet.  Instead,
+      // we compute the day name (e.g. Monday) for each of the next seven days
+      // starting from today and fetch matching rows for the logged‑in teacher.
+      // Accept either teacher email or display name as the identifier.
+      const identifier = (e.parameter.email || '').toLowerCase().trim();
+      const days = [];
+      const today = new Date();
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(today.getTime() + i * 24 * 3600 * 1000);
+        const iso = Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+        const dayName = Utilities.formatDate(d, Session.getScriptTimeZone(), 'EEEE');
+        days.push({ date: iso, dayName });
+      }
+      const sh = _getSheet('Timetable');
+      const headers = _headers(sh);
+      const list = _rows(sh)
+        .map(r => _indexByHeader(r, headers))
+        .filter(r => {
+          const te = String(r.teacherEmail || '').toLowerCase();
+          const tn = String(r.teacherName || '').toLowerCase();
+          return identifier && (te === identifier || tn === identifier);
+        });
+      const grouped = days.map(({ date, dayName }) => {
+        const normalizedDay = _normalizeDayName(dayName);
+        const periods = list
+          .filter(x => _normalizeDayName(String(x.dayOfWeek || '')) === normalizedDay)
+          .map(x => ({
+            period: Number(x.period),
+            class: String(x.class || ''),
+            subject: String(x.subject || ''),
+            teacherName: String(x.teacherName || '')
+          }))
+          .sort((a, b) => a.period - b.period);
+        return { day: dayName, date, periods };
+      });
+      return _respond(grouped);
+    }
+
+    if (action === 'getAppSettings') {
+      // Read key/value settings and return normalized object
+      const sh = _getSheet('Settings');
+      _ensureHeaders(sh, SHEETS.Settings);
+      const headers = _headers(sh);
+      const rows = _rows(sh).map(r => _indexByHeader(r, headers));
+      const map = {};
+      rows.forEach(r => {
+        const k = String(r.key || '').trim();
+        if (!k) return;
+        map[k] = r.value;
+      });
+
+      // Normalize types and provide sensible defaults
+  // lessonPlanningDay: if unset in Settings, return empty (no restriction on client)
+  const lessonPlanningDay = _normalizeDayName(map.lessonPlanningDay);
+  // allowNextWeekOnly: default to false unless explicitly set to 'true'
+  const allowNextWeekOnly = String(map.allowNextWeekOnly || '').toLowerCase() === 'true';
+
+      // periodTimes may be a JSON string; attempt to parse if present
+      let periodTimes = null;
+      if (map.periodTimes && typeof map.periodTimes === 'string') {
+        try {
+          const parsed = JSON.parse(map.periodTimes);
+          if (Array.isArray(parsed)) periodTimes = parsed;
+        } catch (e) {
+          // leave as null if parsing fails
+        }
+      }
+
+      return _respond({ settings: { lessonPlanningDay, allowNextWeekOnly, periodTimes } });
+    }
+
+    if (action === 'getTeacherDailyTimetable') {
+      // Daily timetable for weekly schedule: compute the day name from the
+      // provided date (or today) and return all periods matching that dayOfWeek.
+      // Accept either teacher email or display name as the identifier.
+      // ALSO include substitution assignments where this teacher is the substitute.
+      const identifier = (e.parameter.email || '').toLowerCase().trim();
+      const date = (e.parameter.date || _todayISO()).trim();
+      // Get the day name for the supplied date in the script's timezone.
+      const dayName = _dayName(date);
+      const sh = _getSheet('Timetable');
+      const headers = _headers(sh);
+      
+      // Get regular timetable periods
+      const regularPeriods = _rows(sh)
+        .map(r => _indexByHeader(r, headers))
+        .filter(r => {
+          const te = String(r.teacherEmail || '').toLowerCase();
+          const tn = String(r.teacherName || '').toLowerCase();
+          const rowDay = _normalizeDayName(String(r.dayOfWeek || ''));
+          return identifier && (te === identifier || tn === identifier) && rowDay === _normalizeDayName(dayName);
+        })
+        .map(x => ({
+          period: Number(x.period),
+          class: x.class,
+          subject: x.subject,
+          teacherName: x.teacherName || '',
+          isSubstitution: false
+        }));
+      
+      // Get substitution assignments where this teacher is the substitute
+      const subSh = _getSheet('Substitutions');
+      const subHeaders = _headers(subSh);
+      const substitutionPeriods = _rows(subSh)
+        .map(r => _indexByHeader(r, subHeaders))
+        .filter(r => {
+          if (String(r.date || '') !== date) return false;
+          const ste = String(r.substituteTeacher || '').toLowerCase();
+          return identifier && (ste === identifier || ste.indexOf(identifier) !== -1);
+        })
+        .map(x => ({
+          period: Number(x.period),
+          class: String(x.class || ''),
+          subject: String(x.substituteSubject || x.regularSubject || ''),
+          teacherName: String(x.substituteTeacher || ''),
+          isSubstitution: true,
+          absentTeacher: String(x.absentTeacher || ''),
+          regularSubject: String(x.regularSubject || '')
+        }));
+      
+      // Combine regular and substitution periods, sort by period
+      const allPeriods = [...regularPeriods, ...substitutionPeriods].sort((a, b) => a.period - b.period);
+      
+      return _respond(allPeriods);
+    }
+
+    if (action === 'getTeacherLessonPlanFilters') {
+      const email = (e.parameter.email || '').toLowerCase().trim();
+      const sh = _getSheet('Timetable');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers))
+        .filter(r => String(r.teacherEmail||'').toLowerCase() === email);
+      const subjects = Array.from(new Set(list.map(x => String(x.subject||'')).filter(Boolean))).sort();
+      const classes = Array.from(new Set(list.map(x => String(x.class||'')).filter(Boolean))).sort();
+      return _respond({ subjects, classes });
+    }
+
+    if (action === 'getTeacherLessonPlans') {
+      const email = (e.parameter.email || '').toLowerCase().trim();
+      const subject = (e.parameter.subject || '').trim();
+      const cls = (e.parameter['class'] || '').trim();
+      const status = (e.parameter.status || '').trim();
+      const search = (e.parameter.search || '').toLowerCase().trim();
+      const sh = _getSheet('LessonPlans');
+      const headers = _headers(sh);
+      let list = _rows(sh).map(r => _indexByHeader(r, headers))
+        .filter(p => String(p.teacherEmail||'').toLowerCase() === email);
+      if (subject) list = list.filter(p => p.subject === subject);
+      if (cls) list = list.filter(p => p.class === cls);
+      if (status) list = list.filter(p => p.status === status);
+      if (search) list = list.filter(p => String(p.chapter||'').toLowerCase().indexOf(search) !== -1);
+      // normalize
+      list = list.map(p => ({
+        lpId: String(p.lpId),
+        class: String(p.class),
+        subject: String(p.subject),
+        chapter: String(p.chapter),
+        session: Number(p.session),
+        status: String(p.status||''),
+        objectives: String(p.objectives||''),
+        activities: String(p.activities||'')
+      }));
+      return _respond(list);
+    }
+
+    if (action === 'getPendingPlans') {
+      const page = Number(e.parameter.page || 1);
+      const pageSize = Number(e.parameter.pageSize || 10);
+      const teacher = (e.parameter.teacher || '').toLowerCase().trim();
+      const cls = (e.parameter['class'] || '').trim();
+      const subject = (e.parameter.subject || '').trim();
+      const month = (e.parameter.month || '').trim();
+
+      const sh = _getSheet('Schemes');
+      const headers = _headers(sh);
+      let list = _rows(sh).map(r => _indexByHeader(r, headers))
+        .filter(p => String(p.status || 'Pending') === 'Pending');
+      if (teacher) list = list.filter(p => String(p.teacherEmail||'').toLowerCase() === teacher || String(p.teacherName||'').toLowerCase().indexOf(teacher) !== -1);
+      if (cls) list = list.filter(p => p.class === cls);
+      if (subject) list = list.filter(p => p.subject === subject);
+      if (month) list = list.filter(p => p.month === month);
+      const totalCount = list.length;
+      const start = (page-1)*pageSize;
+      const end = start + pageSize;
+      const pageItems = list.slice(start, end).map(p => ({
+        schemeId: String(p.schemeId),
+        teacherName: String(p.teacherName||''),
+        class: String(p.class||''),
+        subject: String(p.subject||''),
+        chapter: String(p.chapter||''),
+        month: String(p.month||''),
+        noOfSessions: Number(p.noOfSessions||0),
+        status: String(p.status || 'Pending')
+      }));
+      return _respond({ plans: pageItems, totalCount, page, pageSize });
+    }
+
+    if (action === 'getLessonReviewFilters') {
+      const sh = _getSheet('LessonPlans');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers));
+      const teachers = Array.from(new Set(list.map(p => p.teacherName).filter(Boolean))).sort();
+      const classes = Array.from(new Set(list.map(p => p.class).filter(Boolean))).sort();
+      const subjects = Array.from(new Set(list.map(p => p.subject).filter(Boolean))).sort();
+      return _respond({ teachers, classes, subjects });
+    }
+
+    if (action === 'getPendingLessonReviews') {
+      const teacher = (e.parameter.teacher || '').trim();
+      const cls = (e.parameter['class'] || '').trim();
+      const subject = (e.parameter.subject || '').trim();
+      const status = (e.parameter.status || 'Pending Review').trim();
+      const sh = _getSheet('LessonPlans');
+      const headers = _headers(sh);
+      let list = _rows(sh).map(r => _indexByHeader(r, headers))
+        .filter(p => String(p.status||'') === status);
+      if (teacher) list = list.filter(p => p.teacherName === teacher);
+      if (cls) list = list.filter(p => p.class === cls);
+      if (subject) list = list.filter(p => p.subject === subject);
+      list = list.map(p => ({
+        lpId: String(p.lpId),
+        teacherName: String(p.teacherName||''),
+        class: String(p.class||''),
+        subject: String(p.subject||''),
+        chapter: String(p.chapter||''),
+        session: Number(p.session||0),
+        objectives: String(p.objectives||''),
+        activities: String(p.activities||''),
+        status: String(p.status||'')
+      }));
+      return _respond(list);
+    }
+
+    if (action === 'getPendingPreparationLessonPlans') {
+      const email = (e.parameter.email || '').toLowerCase().trim();
+      const sh = _getSheet('LessonPlans');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers))
+        .filter(p => String(p.teacherEmail||'').toLowerCase() === email && String(p.status||'') === 'Pending Preparation')
+        .map(p => ({
+          lessonPlanId: String(p.lpId),
+          class: String(p.class||''),
+          subject: String(p.subject||''),
+          chapter: String(p.chapter||''),
+          session: Number(p.session||0),
+          objectives: String(p.objectives||''),
+          activities: String(p.activities||'')
+        }));
+      return _respond(list);
+    }
+
+    if (action === 'getApprovedLessonPlansForReport') {
+      const email = (e.parameter.email || '').toLowerCase().trim();
+      const cls = (e.parameter['class'] || '').trim();
+      const subject = (e.parameter.subject || '').trim();
+      const sh = _getSheet('LessonPlans');
+      const headers = _headers(sh);
+      let list = _rows(sh).map(r => _indexByHeader(r, headers))
+        .filter(p => String(p.teacherEmail||'').toLowerCase() === email && String(p.status||'') === 'Ready');
+      if (cls) list = list.filter(p => p.class === cls);
+      if (subject) list = list.filter(p => p.subject === subject);
+      list = list.map(p => ({
+        lpId: String(p.lpId),
+        session: Number(p.session||0),
+        chapter: String(p.chapter||''),
+        objectives: String(p.objectives||''),
+        activities: String(p.activities||'')
+      }));
+      return _respond(list);
+    }
+
+    if (action === 'getAllClasses') {
+      const sh = _getSheet('Timetable');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers));
+      const classes = Array.from(new Set(list.map(x => x.class).filter(Boolean))).sort();
+      return _respond(classes);
+    }
+
+    if (action === 'getAllSubjects') {
+      const subjectsSet = new Set();
+      // From Timetable
+      try {
+        const tSh = _getSheet('Timetable');
+        const tHeaders = _headers(tSh);
+        const tList = _rows(tSh).map(r => _indexByHeader(r, tHeaders));
+        tList.forEach(x => { if (x.subject) subjectsSet.add(String(x.subject)); });
+      } catch (e) {}
+      // From Schemes
+      try {
+        const sSh = _getSheet('Schemes');
+        const sHeaders = _headers(sSh);
+        const sList = _rows(sSh).map(r => _indexByHeader(r, sHeaders));
+        sList.forEach(x => { if (x.subject) subjectsSet.add(String(x.subject)); });
+      } catch (e) {}
+      // From LessonPlans
+      try {
+        const lSh = _getSheet('LessonPlans');
+        const lHeaders = _headers(lSh);
+        const lList = _rows(lSh).map(r => _indexByHeader(r, lHeaders));
+        lList.forEach(x => { if (x.subject) subjectsSet.add(String(x.subject)); });
+      } catch (e) {}
+      const subjects = Array.from(subjectsSet).filter(Boolean).sort();
+      return _respond(subjects);
+    }
+
+  if (action === 'getTeacherDailyReportsForDate') {
+      // Return daily report entries for a teacher on a given date.  Each entry
+      // includes class, subject, period, planType, lessonPlanId and a
+      // status string indicating whether the report has been submitted.
+      const email = (e.parameter.email || '').toLowerCase().trim();
+      const date = (e.parameter.date || '').trim();
+      const sh = _getSheet('DailyReports');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers));
+      const filteredList = list.filter(r => String(r.teacherEmail || '').toLowerCase() === email && String(r.date || '') === date)
+        .map(r => {
+          // Determine if report fields have data to infer submission
+          const isSubmitted = String(r.objectives || '').trim() || String(r.activities || '').trim() || String(r.completed || '').trim();
+          return {
+            class: String(r.class || ''),
+            subject: String(r.subject || ''),
+            period: Number(r.period || 0),
+            planType: String(r.planType || ''),
+            lessonPlanId: String(r.lessonPlanId || ''),
+            chapter: String(r.chapter || ''),
+            status: isSubmitted ? 'Submitted' : 'Not Submitted'
+          };
+        });
+      return _respond(filteredList);
+    }
+
+  if (action === 'getDailyReportSummary') {
+      const cls = (e.parameter['class'] || '').trim();
+      const date = (e.parameter.date || '').trim();
+      const sh = _getSheet('DailyReports');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers))
+          .filter(r => String(r.class || '') === cls && String(r.date || '') === date)
+          .map(r => {
+            const submitted = String(r.objectives || '').trim() || String(r.activities || '').trim() || String(r.completed || '').trim();
+            return {
+              class: String(r.class || ''),
+              subject: String(r.subject || ''),
+              period: Number(r.period || 0),
+              planType: String(r.planType || ''),
+              lessonPlanId: String(r.lessonPlanId || ''),
+              chapter: String(r.chapter || ''),
+              teacherName: String(r.teacherName || ''),
+              completed: String(r.completed || ''),
+              status: submitted ? 'Submitted' : 'Not Submitted'
+            };
+          });
+      let lines = [`Summary for ${cls} on ${date}`, ''];
+      list.forEach(r => {
+        lines.push(`P${r.period} ${r.subject} — ${r.teacherName} — ${r.completed || r.status}`);
+      });
+      return _respond(lines.join('\n'));
+    }
+
+    if (action === 'getVacantSlotsForAbsent') {
+      const date = (e.parameter.date || '').trim();
+      // absents list may contain teacher names or emails (case insensitive)
+      const absents = [].concat(e.parameter.absent || []).map(a => String(a).toLowerCase());
+      const sh = _getSheet('Timetable');
+      const headers = _headers(sh);
+      // Determine the day of week based on the provided date since timetable repeats weekly
+      const dayName = _dayName(date);
+      const records = _rows(sh).map(r => _indexByHeader(r, headers));
+      // Select timetable entries matching the day of week and where the teacher is absent
+      const vacant = records
+        .filter(r => {
+          const rowDay = _normalizeDayName(String(r.dayOfWeek || ''));
+          if (rowDay !== _normalizeDayName(dayName)) return false;
+          const teacherNameLower = String(r.teacherName || '').toLowerCase();
+          const teacherEmailLower = String(r.teacherEmail || '').toLowerCase();
+          return absents.indexOf(teacherNameLower) !== -1 || (teacherEmailLower && absents.indexOf(teacherEmailLower) !== -1);
+        })
+        .map(x => ({
+          period: Number(x.period || 0),
+          class: String(x.class || ''),
+          absentTeacher: String(x.teacherName || ''),
+          regularSubject: String(x.subject || '')
+        }));
+      // Fetch already assigned substitutions for the date from Substitutions sheet
+      const subSh = _getSheet('Substitutions');
+      const subHeaders = _headers(subSh);
+      const assigned = _rows(subSh)
+        .map(r => _indexByHeader(r, subHeaders))
+        .filter(r => _isoDateString(r.date) === _isoDateString(date));
+      return _respond({ date, vacantSlots: vacant, assignedSubstitutions: assigned });
+    }
+
+    if (action === 'getPotentialAbsentTeachers') {
+      const sh = _getSheet('Users');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers));
+      // Return array of { name, email } for better client-side handling
+      const persons = Array.from(new Map(list
+        .filter(u => u.name)
+        .map(u => [String(u.email || '').toLowerCase() || String(u.name || ''), { name: String(u.name || ''), email: String(u.email || '') }])
+      ).values());
+      // sort by name
+      persons.sort((a,b) => a.name.localeCompare(b.name));
+      return _respond(persons);
+    }
+
+    if (action === 'getFreeTeachers') {
+      const date = (e.parameter.date || '').trim();
+      const period = Number(e.parameter.period || 0);
+      // absents list may contain teacher names or emails (case insensitive)
+      const absents = [].concat(e.parameter.absent || []).map(a => String(a).toLowerCase());
+      const userSh = _getSheet('Users');
+      const userHeaders = _headers(userSh);
+      const users = _rows(userSh).map(r => _indexByHeader(r, userHeaders));
+
+      const tSh = _getSheet('Timetable');
+      const tHeaders = _headers(tSh);
+      const dayName = _dayName(date);
+      // Determine which teachers have a class at the given day and period
+      const dayRecords = _rows(tSh)
+        .map(r => _indexByHeader(r, tHeaders))
+        .filter(r => _normalizeDayName(String(r.dayOfWeek || '')) === _normalizeDayName(dayName) && Number(r.period || 0) === period);
+      // Build a set of busy identifiers (both name and email lowercased) so we can match users by either field
+      const busy = new Set();
+      dayRecords.forEach(r => {
+        const tn = String(r.teacherName || '').toLowerCase();
+        const te = String(r.teacherEmail || '').toLowerCase();
+        if (tn) busy.add(tn);
+        if (te) busy.add(te);
+      });
+      const free = users.filter(u => {
+        const nameLower = String(u.name || '').toLowerCase();
+        const emailLower = String(u.email || '').toLowerCase();
+        // Exclude teachers who are busy at this slot or are in the absents list (match by name or email)
+        const isBusy = (nameLower && busy.has(nameLower)) || (emailLower && busy.has(emailLower));
+        const isAbsent = (nameLower && absents.indexOf(nameLower) !== -1) || (emailLower && absents.indexOf(emailLower) !== -1);
+        return (nameLower || emailLower) && !isBusy && !isAbsent;
+      });
+      // Return objects { name, email } for richer client usage
+      const persons = free.map(u => ({ name: String(u.name || ''), email: String(u.email || '') })).filter(p => p.name || p.email);
+      persons.sort((a,b) => a.name.localeCompare(b.name));
+      return _respond(persons);
+    }
+
+    if (action === 'getDailyTimetableWithSubstitutions') {
+      const date = (e.parameter.date || '').trim();
+      // For weekly schedules, compute the day name from the date
+      const dayName = _dayName(date);
+      const tSh = _getSheet('Timetable');
+      const tHeaders = _headers(tSh);
+      // Base schedule: rows whose dayOfWeek matches the computed day name
+      const base = _rows(tSh)
+        .map(r => _indexByHeader(r, tHeaders))
+        .filter(r => _normalizeDayName(String(r.dayOfWeek || '')) === _normalizeDayName(dayName));
+      const sSh = _getSheet('Substitutions');
+      const sHeaders = _headers(sSh);
+      const subs = _rows(sSh)
+        .map(r => _indexByHeader(r, sHeaders))
+        .filter(s => _isoDateString(s.date) === _isoDateString(date));
+      const result = base.map(slot => {
+        const m = subs.find(s => Number(s.period) === Number(slot.period) && String(s.class) === String(slot.class));
+        if (m) {
+          return {
+            period: Number(slot.period),
+            class: String(slot.class),
+            teacher: String(m.substituteTeacher || ''),
+            subject: String(m.substituteSubject || ''),
+            isSubstitution: true
+          };
+        }
+        return {
+          period: Number(slot.period),
+          class: String(slot.class),
+          teacher: String(slot.teacherName || ''),
+          subject: String(slot.subject || ''),
+          isSubstitution: false
+        };
+      }).sort((a, b) => a.period - b.period);
+      return _respond({ date, timetable: result });
+    }
+
+    // Return only assigned substitutions for a specific date
+    if (action === 'getAssignedSubstitutions') {
+      const date = (e.parameter.date || '').trim();
+      const sSh = _getSheet('Substitutions');
+      const sHeaders = _headers(sSh);
+      const subs = _rows(sSh)
+        .map(r => _indexByHeader(r, sHeaders))
+        .filter(s => _isoDateString(s.date) === _isoDateString(date));
+      return _respond({ date, assignedSubstitutions: subs });
+    }
+
+    if (action === 'getHmInsights') {
+      const sSh = _getSheet('Schemes');
+      const sHeaders = _headers(sSh);
+      const schemes = _rows(sSh).map(r => _indexByHeader(r, sHeaders));
+      const pendingPlanCount = schemes.filter(s => String(s.status||'') === 'Pending').length;
+
+      const lSh = _getSheet('LessonPlans');
+      const lHeaders = _headers(lSh);
+      const lps = _rows(lSh).map(r => _indexByHeader(r, lHeaders));
+      const pendingLessonCount = lps.filter(p => String(p.status||'') === 'Pending Review').length;
+
+      return _respond({ planCount: pendingPlanCount, lessonCount: pendingLessonCount });
+    }
+
+    if (action === 'getAnalyticsData') {
+      // Minimal placeholder (no mock insertions)
+      return _respond({
+        submissionTrends: { labels: [], data: [] },
+        approvalRates: { labels: ['Approved','Rejected'], data: [0,0] },
+        lessonPlanStatus: { labels: [], data: [] },
+        planStatus: { labels: [], data: [] }
+      });
+    }
+
+    if (action === 'getTeacherSchemes') {
+      // Return all schemes submitted by the teacher, regardless of status
+      const email = (e.parameter.email || '').toLowerCase().trim();
+      const sh = _getSheet('Schemes');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers))
+        .filter(p => String(p.teacherEmail||'').toLowerCase() === email)
+        .map(p => ({
+          schemeId: String(p.schemeId),
+          class: String(p.class||''),
+          subject: String(p.subject||''),
+          chapter: String(p.chapter||''),
+          month: String(p.month||''),
+          term: Number(p.term||0),
+          unit: Number(p.unit||0),
+          noOfSessions: Number(p.noOfSessions||0),
+          status: String(p.status||'')
+        }));
+      return _respond(list);
+    }
+
+    if (action === 'getFullTimetable') {
+      // Return a weekly timetable for all classes grouped by day and period.  Each
+      // day contains an array of periods, and each period contains an array of
+      // entries with class, subject and teacher.  This is used by the
+      // headmaster to view the full school timetable.
+      const sh = _getSheet('Timetable');
+      const headers = _headers(sh);
+      const records = _rows(sh).map(r => _indexByHeader(r, headers));
+      // Collect unique day names from the timetable
+      const dayOrder = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+  const uniqueDays = Array.from(new Set(records.map(r => _normalizeDayName(r.dayOfWeek)).filter(Boolean)));
+    const days = dayOrder.filter(d => uniqueDays.indexOf(d) !== -1);
+      const result = [];
+      days.forEach(dayName => {
+  const dayEntries = records.filter(r => _normalizeDayName(String(r.dayOfWeek || '')) === _normalizeDayName(dayName));
+        if (dayEntries.length > 0) {
+          const periodMap = {};
+          dayEntries.forEach(e => {
+            const p = Number(e.period || 0);
+            if (!periodMap[p]) periodMap[p] = [];
+            periodMap[p].push({
+              class: String(e.class || ''),
+              subject: String(e.subject || ''),
+              teacher: String(e.teacherName || '')
+            });
+          });
+          const periods = Object.keys(periodMap).map(k => ({
+            period: Number(k),
+            entries: periodMap[k]
+          })).sort((a,b) => a.period - b.period);
+          result.push({ day: dayName, periods });
+        }
+      });
+      return _respond(result);
+    }
+
+    // Server-side filtered full timetable for HM
+    // Accepts optional query parameters: class, subject, teacher, date
+    if (action === 'getFullTimetableFiltered') {
+      const cls = (e.parameter['class'] || '').toString().trim();
+      const subject = (e.parameter.subject || '').toString().trim();
+      const teacherParam = (e.parameter.teacher || '').toString().trim().toLowerCase();
+      const dateParam = (e.parameter.date || '').toString().trim();
+
+      const sh = _getSheet('Timetable');
+      const headers = _headers(sh);
+      const records = _rows(sh).map(r => _indexByHeader(r, headers));
+
+      // If date provided, convert to day name
+      let dayFilter = '';
+      if (dateParam) {
+        try {
+          dayFilter = _dayName(dateParam);
+        } catch (err) { dayFilter = '' }
+      }
+
+      // Apply row-level filters
+      const filtered = records.filter(r => {
+        if (cls && String(r.class || '').trim() !== cls) return false;
+        if (subject && String(r.subject || '').trim() !== subject) return false;
+        if (teacherParam) {
+          const te = String(r.teacherEmail || '').toLowerCase();
+          const tn = String(r.teacherName || '').toLowerCase();
+          if (te !== teacherParam && tn.indexOf(teacherParam) === -1) return false;
+        }
+  if (dayFilter && _normalizeDayName(String(r.dayOfWeek || '')) !== _normalizeDayName(dayFilter)) return false;
+        return true;
+      });
+
+      // Build weekly grouped result like getFullTimetable
+      const dayOrder = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+  const uniqueDays = Array.from(new Set(filtered.map(r => _normalizeDayName(r.dayOfWeek)).filter(Boolean)));
+  const days = dayOrder.filter(d => uniqueDays.indexOf(d) !== -1);
+      const result = [];
+      days.forEach(dayName => {
+  const dayEntries = filtered.filter(r => _normalizeDayName(String(r.dayOfWeek || '')) === _normalizeDayName(dayName));
+        if (dayEntries.length > 0) {
+          const periodMap = {};
+          dayEntries.forEach(e => {
+            const p = Number(e.period || 0);
+            if (!periodMap[p]) periodMap[p] = [];
+            periodMap[p].push({
+              class: String(e.class || ''),
+              subject: String(e.subject || ''),
+              teacher: String(e.teacherName || '')
+            });
+          });
+          const periods = Object.keys(periodMap).map(k => ({ period: Number(k), entries: periodMap[k] })).sort((a,b) => a.period - b.period);
+          result.push({ day: dayName, periods });
+        }
+      });
+      return _respond(result);
+    }
+
+    // ===== All Plans =====
+    // Return a combined list of all schemes and lesson plans with optional
+    // filters.  Allows the headmaster to view every plan regardless of
+    // status.  Optional query parameters:
+    //   teacher: filter by teacher email or name (case‑insensitive)
+    //   class:   filter by class name
+    //   subject: filter by subject
+    //   status:  filter by status (e.g. Pending, Approved, Rejected, Ready, Pending Review)
+    if (action === 'getAllPlans') {
+      const teacher = (e.parameter.teacher || '').toLowerCase().trim();
+      const cls = (e.parameter['class'] || '').trim();
+      const subject = (e.parameter.subject || '').trim();
+      const status = (e.parameter.status || '').trim();
+      // fetch schemes
+      const shS = _getSheet('Schemes');
+      const hdrS = _headers(shS);
+      let schemes = _rows(shS).map(r => _indexByHeader(r, hdrS)).map(p => ({
+        type: 'Scheme',
+        schemeId: String(p.schemeId),
+        lpId: '',
+        teacherEmail: String(p.teacherEmail||'').toLowerCase(),
+        teacherName: String(p.teacherName||''),
+        class: String(p.class||''),
+        subject: String(p.subject||''),
+        chapter: String(p.chapter||''),
+        term: String(p.term||''),
+        unit: String(p.unit||''),
+        month: String(p.month||''),
+        noOfSessions: Number(p.noOfSessions||0),
+        session: '',
+        status: String(p.status||''),
+        objectives: '',
+        activities: '',
+        createdAt: String(p.createdAt||'')
+      }));
+      // fetch lesson plans
+      const shL = _getSheet('LessonPlans');
+      const hdrL = _headers(shL);
+      let lessons = _rows(shL).map(r => _indexByHeader(r, hdrL)).map(lp => ({
+        type: 'LessonPlan',
+        schemeId: '',
+        lpId: String(lp.lpId),
+        teacherEmail: String(lp.teacherEmail||'').toLowerCase(),
+        teacherName: String(lp.teacherName||''),
+        class: String(lp.class||''),
+        subject: String(lp.subject||''),
+        chapter: String(lp.chapter||''),
+        term: '',
+        unit: '',
+        month: '',
+        noOfSessions: '',
+        session: String(lp.session||''),
+        status: String(lp.status||''),
+        objectives: String(lp.objectives||''),
+        activities: String(lp.activities||''),
+        createdAt: String(lp.createdAt||'')
+      }));
+      // apply filters
+      if (teacher) {
+        schemes = schemes.filter(p => p.teacherEmail === teacher || p.teacherName.toLowerCase().indexOf(teacher) !== -1);
+        lessons = lessons.filter(lp => lp.teacherEmail === teacher || lp.teacherName.toLowerCase().indexOf(teacher) !== -1);
+      }
+      if (cls) {
+        schemes = schemes.filter(p => p.class === cls);
+        lessons = lessons.filter(lp => lp.class === cls);
+      }
+      if (subject) {
+        schemes = schemes.filter(p => p.subject === subject);
+        lessons = lessons.filter(lp => lp.subject === subject);
+      }
+      if (status) {
+        schemes = schemes.filter(p => p.status === status);
+        lessons = lessons.filter(lp => lp.status === status);
+      }
+      const combined = schemes.concat(lessons);
+      return _respond(combined);
+    }
+
+    // ===== Daily Reports management =====
+    // Return all daily reports with optional filters for teacher, class, subject,
+    // date (exact), fromDate/toDate and status (based on 'completed' field).
+    // Query parameters:
+    //   teacher: filter by teacher email or name (case‑insensitive)
+    //   class: filter by class name
+    //   subject: filter by subject
+    //   date: filter reports matching exact date (yyyy‑mm‑dd)
+    //   fromDate/toDate: inclusive date range filter (yyyy‑mm‑dd)
+    //   status: filter by completion status (e.g. Fully Completed, Partially Completed, Not Started)
+    if (action === 'getDailyReports') {
+      const teacher = (e.parameter.teacher || '').toLowerCase().trim();
+      const cls = (e.parameter['class'] || '').trim();
+      const subject = (e.parameter.subject || '').trim();
+      const date = (e.parameter.date || '').trim();
+      const fromDate = (e.parameter.fromDate || '').trim();
+      const toDate = (e.parameter.toDate || '').trim();
+      const status = (e.parameter.status || '').trim();
+      const sh = _getSheet('DailyReports');
+      const headers = _headers(sh);
+      let list = _rows(sh).map(r => _indexByHeader(r, headers)).map(dr => ({
+        date: String(dr.date||''),
+        teacherEmail: String(dr.teacherEmail||'').toLowerCase(),
+        teacherName: String(dr.teacherName||''),
+        class: String(dr.class||''),
+        subject: String(dr.subject||''),
+        period: String(dr.period||''),
+        planType: String(dr.planType||''),
+        lessonPlanId: String(dr.lessonPlanId||''),
+        chapter: String(dr.chapter||''),
+        objectives: String(dr.objectives||''),
+        activities: String(dr.activities||''),
+        completed: String(dr.completed||''),
+        notes: String(dr.notes||''),
+        createdAt: String(dr.createdAt||'')
+      }));
+      if (teacher) {
+        list = list.filter(r => r.teacherEmail === teacher || r.teacherName.toLowerCase().indexOf(teacher) !== -1);
+      }
+      if (cls) {
+        list = list.filter(r => r.class === cls);
+      }
+      if (subject) {
+        list = list.filter(r => r.subject === subject);
+      }
+      if (date) {
+        list = list.filter(r => r.date === date);
+      }
+      if (fromDate) {
+        list = list.filter(r => r.date >= fromDate);
+      }
+      if (toDate) {
+        list = list.filter(r => r.date <= toDate);
+      }
+      if (status) {
+        list = list.filter(r => r.completed === status);
+      }
+      return _respond(list);
+    }
+
+    if (action === 'getExams') {
+      // Retrieve all exams, optionally filtered by class, subject or examType.
+      const cls = (e.parameter['class'] || '').trim();
+      const subject = (e.parameter.subject || '').trim();
+      const examType = (e.parameter.examType || '').trim();
+      const sh = _getSheet('Exams');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers));
+      let filtered = list;
+      if (cls) filtered = filtered.filter(ex => String(ex.class||'') === cls);
+      if (subject) filtered = filtered.filter(ex => String(ex.subject||'') === subject);
+      if (examType) filtered = filtered.filter(ex => String(ex.examType||'') === examType);
+      const result = filtered.map(ex => ({
+        examId: String(ex.examId||''),
+        creatorEmail: String(ex.creatorEmail||''),
+        creatorName: String(ex.creatorName||''),
+        class: String(ex.class||''),
+        subject: String(ex.subject||''),
+        examType: String(ex.examType||''),
+        internalMax: Number(ex.internalMax||0),
+        externalMax: Number(ex.externalMax||0),
+        totalMax: Number(ex.totalMax||0),
+        date: String(ex.date||'')
+      }));
+      return _respond(result);
+    }
+
+    if (action === 'getExamMarks') {
+      // Return all marks for a given examId.  Provide basic fields for
+      // rendering marks tables in the UI.
+      const examId = (e.parameter.examId || '').trim();
+      if (!examId) return _respond([]);
+      const sh = _getSheet('ExamMarks');
+      const headers = _headers(sh);
+      // Fetch exam metadata to compute percentage and grade boundaries
+      const exSh = _getSheet('Exams');
+      const exHeaders = _headers(exSh);
+      const exList = _rows(exSh).map(r => _indexByHeader(r, exHeaders));
+      const exam = exList.find(ex => String(ex.examId||'') === examId);
+      // Determine exam total and class for grade calculation
+      const examTotalMax = exam && exam.totalMax ? Number(exam.totalMax) : 0;
+      const examClass = exam && exam.class ? String(exam.class) : '';
+      const stdGroup = _standardGroup(examClass);
+      // Load grade boundaries for this group
+      let boundaries = [];
+      if (stdGroup) {
+        const gbSh = _getSheet('GradeBoundaries');
+        _ensureHeaders(gbSh, SHEETS.GradeBoundaries);
+        const gbHeaders = _headers(gbSh);
+        boundaries = _rows(gbSh).map(r => _indexByHeader(r, gbHeaders))
+          .filter(b => String(b.standardGroup||'') === stdGroup)
+          .map(b => ({
+            grade: String(b.grade||''),
+            minPercentage: Number(b.minPercentage||0),
+            maxPercentage: Number(b.maxPercentage||0)
+          }))
+          .sort((a,b) => a.minPercentage - b.minPercentage);
+      }
+      const list = _rows(sh).map(r => _indexByHeader(r, headers))
+        .filter(m => String(m.examId||'') === examId)
+        .map(m => {
+          const internal = Number(m.internal||0);
+          const external = Number(m.external||0);
+          const total = Number(m.total|| (internal + external));
+          // Compute percentage and grade if exam metadata is available
+          let grade = '';
+          if (examTotalMax > 0 && boundaries.length > 0) {
+            const perc = (total / examTotalMax) * 100;
+            const b = boundaries.find(gb => perc >= gb.minPercentage && perc <= gb.maxPercentage);
+            grade = b ? b.grade : '';
+          }
+          return {
+            admNo: String(m.admNo||''),
+            studentName: String(m.studentName||''),
+            internal: internal,
+            external: external,
+            total: total,
+            teacherName: String(m.teacherName||''),
+            grade: grade
+          };
+        });
+      return _respond(list);
+    }
+
+    if (action === 'getStudents') {
+      // Fetch students.  If a class is provided as a parameter, only return
+      // students in that class.  Otherwise return all students.
+      const cls = (e.parameter['class'] || '').trim();
+      const sh = _getSheet('Students');
+      const headers = _headers(sh);
+      let list = _rows(sh).map(r => _indexByHeader(r, headers)).map(s => ({
+        admNo: String(s.admNo||''),
+        name: String(s.name||''),
+        class: String(s.class||''),
+        email: String(s.email||''),
+        parentContact: String(s.parentContact||'')
+      }));
+      if (cls) list = list.filter(s => s.class === cls);
+      return _respond(list);
+    }
+
+    if (action === 'getGradeTypes') {
+      // Return the list of exam grading schemes.  Each entry contains the
+      // examType and the maximum internal, external and total marks.
+      const sh = _getSheet('GradeTypes');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers)).map(g => ({
+        examType: String(g.examType||''),
+        internalMax: Number(g.internalMax||0),
+        externalMax: Number(g.externalMax||0),
+        totalMax: Number(g.totalMax||0)
+      }));
+      return _respond(list);
+    }
+
+    if (action === 'getGradeBoundaries') {
+      // Return the grade boundary definitions.  Each entry describes
+      // a percentage range for a given standard group and grade label.
+      const sh = _getSheet('GradeBoundaries');
+      _ensureHeaders(sh, SHEETS.GradeBoundaries);
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers)).map(b => ({
+        standardGroup: String(b.standardGroup||''),
+        grade: String(b.grade||''),
+        minPercentage: Number(b.minPercentage||0),
+        maxPercentage: Number(b.maxPercentage||0)
+      }));
+      return _respond(list);
+    }
+
+    if (action === 'getAttendance') {
+      // Retrieve attendance records.  Optional filters include class and date.
+      const cls = (e.parameter['class'] || '').trim();
+      const date = (e.parameter.date || '').trim();
+      const sh = _getSheet('Attendance');
+      const headers = _headers(sh);
+      let list = _rows(sh).map(r => _indexByHeader(r, headers)).map(a => ({
+        date: String(a.date||''),
+        class: String(a.class||''),
+        admNo: String(a.admNo||''),
+        studentName: String(a.studentName||''),
+        status: String(a.status||''),
+        teacherName: String(a.teacherName||'')
+      }));
+      if (cls) list = list.filter(a => a.class === cls);
+      if (date) list = list.filter(a => a.date === date);
+      return _respond(list);
+    }
+
+    if (action === 'getStudentPerformance') {
+      // Compute average performance for students in a class across all exams.
+      const cls = (e.parameter['class'] || '').trim();
+      if (!cls) return _respond([]);
+      const marksSh = _getSheet('ExamMarks');
+      const marksHeaders = _headers(marksSh);
+      const marks = _rows(marksSh)
+        .map(r => _indexByHeader(r, marksHeaders))
+        .filter(m => String(m.class||'') === cls);
+      const perfMap = {};
+      marks.forEach(m => {
+        const adm = String(m.admNo||'');
+        const name = String(m.studentName||'');
+        const total = Number(m.total||0);
+        if (!perfMap[adm]) perfMap[adm] = { name, totalSum: 0, count: 0 };
+        perfMap[adm].totalSum += total;
+        perfMap[adm].count += 1;
+      });
+      const results = Object.keys(perfMap).map(adm => {
+        const entry = perfMap[adm];
+        const average = entry.count > 0 ? entry.totalSum / entry.count : 0;
+        return {
+          admNo: adm,
+          name: entry.name,
+          average: average,
+          examCount: entry.count
+        };
+      });
+      // Sort by average descending
+      results.sort((a,b) => b.average - a.average);
+      return _respond(results);
+    }
+    
+    if (action === 'getCalendarEvents') {
+      // Combine timetable, lesson plans, substitutions, and personal events into calendar events
+      const email = (e.parameter.email || '').toLowerCase().trim();
+      const startDate = (e.parameter.startDate || '').trim();
+      const endDate = (e.parameter.endDate || '').trim();
+      
+      // Array to hold all calendar events
+      const calendarEvents = [];
+      
+      try {
+        // Get teacher's weekly timetable directly
+        const tSh = _getSheet('Timetable');
+        const tHeaders = _headers(tSh);
+        
+        // Compute the next 7 days for timetable events
+        const days = [];
+        const today = new Date();
+        for (let i = 0; i < 7; i++) {
+          const d = new Date(today.getTime() + i * 24 * 3600 * 1000);
+          const iso = Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+          const dayName = Utilities.formatDate(d, Session.getScriptTimeZone(), 'EEEE');
+          days.push({ date: iso, dayName });
+        }
+        
+        // Get timetable entries for this teacher
+        const timetableRows = _rows(tSh)
+          .map(r => _indexByHeader(r, tHeaders))
+          .filter(r => {
+            const te = String(r.teacherEmail || '').toLowerCase();
+            const tn = String(r.teacherName || '').toLowerCase();
+            return email && (te === email || tn === email);
+          });
+        
+        // Create events for each day's periods from timetable
+        days.forEach(({ date, dayName }) => {
+          const normalizedDay = _normalizeDayName(dayName);
+          const periods = timetableRows
+            .filter(x => _normalizeDayName(String(x.dayOfWeek || '')) === normalizedDay);
+          
+          periods.forEach(period => {
+            // Create event for each period
+            const startHour = 7 + Number(period.period);
+            const endHour = startHour + 1;
+            
+            const dayDate = new Date(date);
+            const start = new Date(dayDate);
+            start.setHours(startHour, 0, 0);
+            
+            const end = new Date(dayDate);
+            end.setHours(endHour, 0, 0);
+            
+            calendarEvents.push({
+              id: `${date}-${period.period}`,
+              type: 'timetable',
+              title: `${period.class} - ${period.subject}`,
+              date: date,
+              day: dayName,
+              period: period.period,
+              class: period.class || '',
+              subject: period.subject || '',
+              start: start.toISOString(),
+              end: end.toISOString()
+            });
+          });
+        });
+        
+        // Get lesson plans
+        const lpSh = _getSheet('LessonPlans');
+        const lpHeaders = _headers(lpSh);
+        const lessonPlans = _rows(lpSh)
+          .map(r => _indexByHeader(r, lpHeaders))
+          .filter(lp => String(lp.teacherEmail || '').toLowerCase() === email);
+
+        // Process lesson plans into events or mark existing events
+        lessonPlans.forEach(plan => {
+          // Find matching timetable slots
+          calendarEvents.forEach(event => {
+            if (event.class === plan.class &&
+                event.subject === plan.subject &&
+                Number(event.period) === Number(plan.session)) {
+              // Update the matching event with lesson plan information
+              event.lessonPlan = true;
+              event.lpId = plan.lpId;
+              event.status = plan.status || '';
+              event.objectives = plan.objectives || '';
+              event.activities = plan.activities || '';
+            }
+          });
+        });        // Get substitutions for today and tomorrow
+        const dates = [_todayISO()];
+        
+        // Add tomorrow's date
+        const tomorrow = new Date();
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        const tomorrowISO = Utilities.formatDate(tomorrow, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+        dates.push(tomorrowISO);
+        
+        // Process substitutions
+        const subSh = _getSheet('Substitutions');
+        const subHeaders = _headers(subSh);
+        const substitutions = _rows(subSh)
+          .map(r => _indexByHeader(r, subHeaders))
+          .filter(s => dates.includes(String(s.date || '')) && 
+                       String(s.substituteTeacher || '').toLowerCase().indexOf(email) !== -1);
+        
+        // Add substitution events
+        substitutions.forEach(sub => {
+          const startHour = 7 + Number(sub.period);
+          const endHour = startHour + 1;
+          
+          const dayDate = new Date(sub.date);
+          const start = new Date(dayDate);
+          start.setHours(startHour, 0, 0);
+          
+          const end = new Date(dayDate);
+          end.setHours(endHour, 0, 0);
+          
+          calendarEvents.push({
+            id: `substitution-${sub.date}-${sub.period}-${sub.class}`,
+            type: 'substitution',
+            title: `${sub.class} - ${sub.substituteSubject || sub.regularSubject} (Substitution)`,
+            date: sub.date,
+            period: sub.period,
+            class: sub.class,
+            subject: sub.substituteSubject || sub.regularSubject,
+            start: start.toISOString(),
+            end: end.toISOString()
+          });
+        });
+        
+        // Get personal calendar events
+        const calSh = _getSheet('CalendarEvents');
+        const calHeaders = _headers(calSh);
+        const personalEvents = _rows(calSh)
+          .map(r => _indexByHeader(r, calHeaders))
+          .filter(e => String(e.userEmail || '').toLowerCase() === email);
+        
+        // Add personal events to the response
+        personalEvents.forEach(e => {
+          let start, end;
+          
+          try {
+            start = new Date(e.startTime);
+            end = new Date(e.endTime);
+          } catch (err) {
+            console.warn('Invalid date format for event:', e.eventId);
+            return; // Skip this event
+          }
+          
+          calendarEvents.push({
+            id: e.eventId,
+            type: e.type || 'personal',
+            title: e.title || 'Untitled Event',
+            class: e.class || '',
+            subject: e.subject || '',
+            notes: e.notes || '',
+            color: e.color || '#8b5cf6', // Default purple for personal events
+            start: start.toISOString(),
+            end: end.toISOString(),
+            allDay: e.allDay === 'true' || e.allDay === true,
+            isPersonalEvent: true
+          });
+        });
+        
+        return _respond(calendarEvents);
+      } catch (err) {
+        console.error("Calendar error:", err);
+        return _respond({ error: String(err.message || err) });
+      }
+    }
+
+    return _respond({ error: 'Unknown action' });
+  } catch (err) {
+    return _respond({ error: String(err && err.message ? err.message : err) });
+  }
+}
+
+// (Removed earlier duplicate doPost definition to avoid overriding the main doPost below.)
+
+/**
+ * Handle Google authentication with either direct user info or access token.
+ * New approach: frontend gets user info directly from Google using access token,
+ * then sends the info to the backend directly.
+ * 
+ * Expects payload with either:
+ * 1. { email, name, google_id, picture, access_token } - Direct user info from Google
+ * 2. { idToken } - Legacy support for ID tokens
+ * 
+ * Updated with improved error handling and detailed logging
+ */
+function _handleGoogleLogin(payload) {
+  try {
+    // Input validation with detailed error
+    if (!payload) {
+      Logger.log("googleLogin error: Empty payload");
+      return _respond({ error: 'Missing payload' });
+    }
+    
+    Logger.log("Received auth payload from client: " + JSON.stringify(payload));
+    
+    // Handle direct user info (new approach)
+    if (payload.email && payload.google_id) {
+      Logger.log("Using direct user info authentication method");
+      
+      const email = String(payload.email || '').toLowerCase().trim();
+      const name = String(payload.name || '').trim();
+      const picture = String(payload.picture || '').trim();
+      
+      if (!email) {
+        Logger.log("googleLogin error: Missing email in payload");
+        return _respond({ error: 'Missing email in authentication payload' });
+      }
+      
+      Logger.log("Looking up user with email: " + email);
+      
+      // Lookup user in Users sheet
+      const sh = _getSheet('Users');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers));
+      
+      // Log all users for debugging (email only)
+      Logger.log("Available users: " + list.map(u => String(u.email || '')).join(', '));
+      
+      const found = list.find(u => String(u.email || '').toLowerCase() === email);
+      if (!found) {
+        Logger.log("googleLogin error: User not registered - " + email);
+        return _respond({ error: 'User not registered' });
+      }
+      
+      Logger.log("User found: " + found.name);
+      
+      // Normalize roles/classes/subjects
+      const roleStr = (found.roles || found.role || '').toString();
+      const roles = roleStr.split(',').map(s => s.trim()).filter(Boolean);
+      const classStr = (found.classes || found.Class || found.Classes || '').toString();
+      const classes = classStr.split(',').map(s => s.trim()).filter(Boolean);
+      const subjStr = (found.subjects || found.Subject || found.Subjects || '').toString();
+      const subjects = subjStr.split(',').map(s => s.trim()).filter(Boolean);
+      const classTeacherFor = found.classTeacherFor || found['Class Teacher For'] || '';
+      
+      Logger.log("Login successful for: " + email + ", roles: " + roles.join(', '));
+      
+      return _respond({
+        email,
+        name: found.name || name || '',
+        roles,
+        classes,
+        subjects,
+        classTeacherFor,
+        picture: picture || ''
+      });
+    }
+    
+    // Legacy support for ID token authentication
+    if (payload.idToken) {
+      Logger.log("Using legacy ID token authentication method");
+      
+      const token = String(payload.idToken || '').trim();
+      if (!token) {
+        Logger.log("googleLogin error: Empty token");
+        return _respond({ error: 'Empty authentication token' });
+      }
+      
+      Logger.log("Received token from client...");
+      Logger.log("Length: " + token.length);
+      Logger.log("Prefix: " + token.substring(0, 10) + "...");
+      
+      // First determine if we received an authorization code (starts with '4/') or ID token (longer JWT format)
+      let isAuthCode = token.startsWith('4/');
+      let tokenInfo;
+      
+      if (isAuthCode) {
+        Logger.log("Auth code format detected but not supported in this version");
+        return _respond({ error: 'Authorization code flow not supported. Please update the frontend.' });
+      } else {
+        // Handle as ID token directly
+        Logger.log("Handling as ID token. Validating with tokeninfo endpoint...");
+        
+        // Try ID token validation
+        const url = 'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(token);
+        Logger.log("Fetching token info from: " + url);
+        
+        const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+        const responseCode = resp.getResponseCode();
+        Logger.log("Google token validation response code: " + responseCode);
+        
+        // Enhanced error handling with specific errors
+        if (responseCode !== 200) {
+          const responseText = resp.getContentText();
+          Logger.log("Token validation failed with response: " + responseText);
+          
+          // Try to parse the error for better error messages
+          try {
+            const errorInfo = JSON.parse(responseText);
+            if (errorInfo.error) {
+              Logger.log("Token validation error: " + errorInfo.error);
+              Logger.log("Error description: " + (errorInfo.error_description || 'No description'));
+              return _respond({ 
+                error: 'Invalid Google token: ' + errorInfo.error, 
+                details: errorInfo.error_description 
+              });
+            }
+          } catch (e) {
+            // Parsing failed, just continue with generic error
+          }
+          
+          return _respond({ error: 'Invalid Google token (HTTP ' + responseCode + ')' });
+        }
+        
+        tokenInfo = JSON.parse(resp.getContentText());
+      }
+    
+      // For legacy ID token flow, continue with token validation
+      // Log critical fields for debugging
+      Logger.log("Token validation successful. Processing token info...");
+      Logger.log("Token issued to: " + (tokenInfo.email || 'Unknown'));
+      Logger.log("Email verified: " + (tokenInfo.email_verified || tokenInfo.emailVerified || 'unknown'));
+      Logger.log("Audience: " + (tokenInfo.aud || 'Unknown'));
+      Logger.log("Issuer: " + (tokenInfo.iss || 'Unknown'));
+      
+      // Verify email is verified
+      const verified = String(tokenInfo.email_verified || tokenInfo.emailVerified || '').toLowerCase();
+      if (verified !== 'true') {
+        Logger.log("googleLogin error: Email not verified");
+        return _respond({ error: 'Email not verified' });
+      }
+      
+      // Extract and normalize email
+      const email = String(tokenInfo.email || '').toLowerCase().trim();
+      if (!email) {
+        Logger.log("googleLogin error: Token missing email");
+        return _respond({ error: 'Token missing email' });
+      }
+      
+      // Get name and picture from token info
+      const userName = tokenInfo.name || '';
+      const userPicture = tokenInfo.picture || '';
+      
+      Logger.log("Looking up user with email: " + email);
+      
+      // Lookup user in Users sheet
+      const sh = _getSheet('Users');
+      const headers = _headers(sh);
+      const list = _rows(sh).map(r => _indexByHeader(r, headers));
+      
+      // Log all users for debugging (email only)
+      Logger.log("Available users: " + list.map(u => String(u.email || '')).join(', '));
+      
+      const found = list.find(u => String(u.email || '').toLowerCase() === email);
+      if (!found) {
+        Logger.log("googleLogin error: User not registered - " + email);
+        return _respond({ error: 'User not registered' });
+      }
+      
+      Logger.log("User found: " + found.name);
+      
+      // Normalize roles/classes/subjects
+      const roleStr = (found.roles || found.role || '').toString();
+      const roles = roleStr.split(',').map(s => s.trim()).filter(Boolean);
+      const classStr = (found.classes || found.Class || found.Classes || '').toString();
+      const classes = classStr.split(',').map(s => s.trim()).filter(Boolean);
+      const subjStr = (found.subjects || found.Subject || found.Subjects || '').toString();
+      const subjects = subjStr.split(',').map(s => s.trim()).filter(Boolean);
+      const classTeacherFor = found.classTeacherFor || found['Class Teacher For'] || '';
+      
+      Logger.log("Login successful for: " + email + ", roles: " + roles.join(', '));
+      
+      return _respond({
+        email,
+        name: found.name || userName || '',
+        roles,
+        classes,
+        subjects,
+        classTeacherFor,
+        picture: userPicture || ''
+      });
+    }
+    
+    return _respond({ error: 'Invalid authentication payload format' });
+  } catch (err) {
+    Logger.log("googleLogin critical error: " + (err && err.message ? err.message : String(err)));
+    Logger.log("Stack trace: " + (err && err.stack ? err.stack : 'No stack trace'));
+    return _respond({ 
+      error: 'googleLogin failed: ' + (err && err.message ? err.message : String(err)),
+      details: 'Check Apps Script logs for more information'
+    });
+  }
+}
+
+function doPost(e) {
+  const action = (e.parameter.action || '').trim();
+  const data = _parsePost(e);
+  try {
+    Logger.log("Handling POST request for action: " + action);
+    Logger.log("POST data: " + JSON.stringify(data));
+    
+    _bootstrapSheets();
+    
+    // Handle ping action
+    if (action === 'ping') {
+      // Use jsonResponse directly if available
+      try {
+        if (typeof jsonResponse === 'function') {
+          return jsonResponse({ ok: true, now: new Date().toISOString() });
+        }
+      } catch (e) {
+        // Fall back to _respond if jsonResponse isn't available
+      }
+      return _respond({ ok: true, now: new Date().toISOString() });
+    }
+    
+    // googleLogin moved into unified doPost handler
+    if (action === 'googleLogin') {
+      // The _handleGoogleLogin function already uses _respond internally, which will use jsonResponse if available
+      return _handleGoogleLogin(data);
+    }
+    if (action === 'submitPlan') {
+      const sh = _getSheet('Schemes');
+      _ensureHeaders(sh, SHEETS.Schemes);
+      const now = new Date().toISOString();
+      const schemeId = _uuid();
+      const line = [
+        schemeId,
+        (data.email||'').toLowerCase().trim(),
+        data.teacherName || '',
+        data.class || '',
+        data.subject || '',
+        Number(data.term||0),
+        Number(data.unit||0),
+        data.chapter || '',
+        data.month || '',
+        Number(data.noOfSessions||0),
+        'Pending',
+        now
+      ];
+  sh.appendRow(line);
+  return _respond({ submitted: true });
+  }
+
+    if (action === 'updatePlanStatus') {
+      const { schemeId, status } = data;
+      const sh = _getSheet('Schemes');
+      const headers = _headers(sh);
+      const idIdx = headers.indexOf('schemeId');
+      const statusIdx = headers.indexOf('status');
+      const nameIdx = headers.indexOf('teacherName');
+      const emailIdx = headers.indexOf('teacherEmail');
+      const classIdx = headers.indexOf('class');
+      const subjectIdx = headers.indexOf('subject');
+      const chapterIdx = headers.indexOf('chapter');
+      const sessionsIdx = headers.indexOf('noOfSessions');
+
+      const last = sh.getLastRow();
+      if (last < 2) return _respond({ error: 'Not found' });
+      const values = sh.getRange(2,1,last-1,headers.length).getValues();
+      for (let i=0;i<values.length;i++) {
+        if (String(values[i][idIdx]) === String(schemeId)) {
+          values[i][statusIdx] = status;
+          sh.getRange(2+i,1,1,headers.length).setValues([values[i]]);
+          return _respond({ submitted: true });
+        }
+      }
+      return _respond({ error: 'Scheme not found' });
+    }
+
+    if (action === 'submitLessonPlanDetails') {
+      // Add debug logging
+      Logger.log("LP_SUBMIT: Starting lesson plan submission");
+
+      // Accepts payload: lpId, class, subject, session, schemeId (optional),
+      // objectives, activities, date, teacherEmail, teacherName, notes
+      const { lpId, objectives, activities, date, class: cls, subject, session, schemeId, teacherEmail, teacherName, notes } = data;
+
+      Logger.log(`LP_SUBMIT: Received - class:"${cls}", subject:"${subject}", session:${session}, lpId:${lpId || 'new'}`);
+      Logger.log(`LP_SUBMIT: Received - objectives:"${objectives}", activities:"${activities}", date:"${date}"`);
+      
+      const sh = _getSheet('LessonPlans');
+      _ensureHeaders(sh, SHEETS.LessonPlans);
+      const headers = _headers(sh);
+      const idIdx = headers.indexOf('lpId');
+      const classIdx = headers.indexOf('class');
+      const subjIdx = headers.indexOf('subject');
+      const sessionIdx = headers.indexOf('session');
+      const chapterIdx = headers.indexOf('chapter');
+      const objIdx = headers.indexOf('objectives');
+      const actIdx = headers.indexOf('activities');
+      const dateIdx = headers.indexOf('date');
+      const statusIdx = headers.indexOf('status');
+      const createdAtIdx = headers.indexOf('createdAt');
+
+      const last = sh.getLastRow();
+      const values = last >= 2 ? sh.getRange(2,1,last-1,headers.length).getValues() : [];
+
+      // Determine chapter from provided schemeId (if available) to include in duplicate check
+      let chapterFromScheme = '';
+      if (schemeId) {
+        try {
+          const sSh = _getSheet('Schemes');
+          const sHdr = _headers(sSh);
+          const sVals = _rows(sSh).map(r => _indexByHeader(r, sHdr));
+          const foundScheme = sVals.find(s => String(s.schemeId || '') === String(schemeId));
+          if (foundScheme) chapterFromScheme = String(foundScheme.chapter || '');
+        } catch (e) {
+          // ignore and continue
+        }
+      }
+
+      const clsStr = String(cls || '').trim();
+      const subjStr = String(subject || '').trim();
+      const sessNum = Number(session || 0);
+      
+      // DEBUG HELPER: Show all rows with matching class/subject/session to see why we're not finding them
+      Logger.log(`LP_SUBMIT: DEBUG - Showing all rows matching class:${clsStr}, subject:${subjStr}, session:${sessNum}`);
+      for (let i=0; i<values.length; i++) {
+        const rowClass = String(values[i][classIdx] || '').trim();
+        const rowSubj = String(values[i][subjIdx] || '').trim();
+        const rowSession = Number(values[i][sessionIdx] || 0);
+        
+        if (rowClass === clsStr && rowSubj === subjStr && rowSession === sessNum) {
+          Logger.log(`LP_SUBMIT: DEBUG MATCH at row ${i+2}:`);
+          Logger.log(`  - lpId: ${values[i][idIdx] || '(empty)'}`);
+          Logger.log(`  - class: "${rowClass}"`);
+          Logger.log(`  - subject: "${rowSubj}"`);
+          Logger.log(`  - session: ${rowSession}`);
+          Logger.log(`  - chapter: "${values[i][chapterIdx] || '(empty)'}"}`);
+          Logger.log(`  - status: "${values[i][statusIdx] || '(empty)'}"}`);
+          Logger.log(`  - objectives: "${values[i][objIdx] || '(empty)'}"}`);
+          Logger.log(`  - activities: "${values[i][actIdx] || '(empty)'}"}`);
+        }
+      }
+
+      // UPDATED LOGIC: First look for any placeholder rows for the class/subject/session
+      // and prefer updating those instead of creating duplicates
+      Logger.log(`LP_SUBMIT: Checking for placeholders/duplicates, total rows: ${values.length}`);
+      Logger.log(`LP_SUBMIT: Looking for class:${clsStr}, subject:${subjStr}, session:${sessNum}, chapter:${chapterFromScheme || '(none)'}`);
+      
+      // SPECIAL CASE: For STD 7A/English submissions, completely bypass duplicate detection and always create new rows
+      // REMOVE THIS AFTER TESTING IS COMPLETE
+      Logger.log(`LP_SUBMIT: Checking special case: clsStr="${clsStr}", subjStr="${subjStr}"`);
+      Logger.log(`LP_SUBMIT: Special case check: clsStr === 'STD  7A' is ${clsStr === 'STD  7A'}`);
+      Logger.log(`LP_SUBMIT: Special case check: clsStr === 'STD 7A' is ${clsStr === 'STD 7A'}`);
+      Logger.log(`LP_SUBMIT: Special case check: subjStr === 'English' is ${subjStr === 'English'}`);
+      Logger.log(`LP_SUBMIT: DEBUG - Actual values: clsStr=[${clsStr}], subjStr=[${subjStr}]`);
+      
+      if ((clsStr === 'STD  7A' || clsStr === 'STD 7A') && subjStr === 'English') {
+        Logger.log(`LP_SUBMIT: *** SPECIAL CASE *** Bypassing duplicate detection for ${clsStr}/${subjStr}`);
+        Logger.log(`LP_SUBMIT: *** SPECIAL CASE *** clsStr: "${clsStr}", subjStr: "${subjStr}", sessNum: ${sessNum}`);
+        // If lpId is provided, try to update that specific row, otherwise create a new row
+        if (lpId) {
+          for (let i=0; i<values.length; i++) {
+            if (String(values[i][idIdx] || '') === String(lpId)) {
+              Logger.log(`LP_SUBMIT: Found matching lpId ${lpId} at row ${i+2} - will update this row`);
+              values[i][objIdx] = objectives || '';
+              values[i][actIdx] = activities || '';
+              values[i][dateIdx] = date || '';
+              values[i][statusIdx] = 'Pending Review';
+              sh.getRange(2+i,1,1,headers.length).setValues([values[i]]);
+              Logger.log(`LP_SUBMIT: Updated row ${i+2} with new values`);
+              return _respond({ submitted: true });
+            }
+          }
+        }
+
+        // If no lpId or no matching row found, create a new row
+        const now = new Date().toISOString();
+        const newLpId = _uuid();
+        const newRow = [];
+        newRow[0] = newLpId;
+        newRow[1] = (teacherEmail||'').toLowerCase().trim();
+        newRow[2] = teacherName || '';
+        newRow[3] = clsStr;
+        newRow[4] = subjStr;
+        newRow[5] = chapterFromScheme || '';
+        newRow[6] = sessNum;
+        newRow[7] = objectives || '';
+        newRow[8] = activities || '';
+        newRow[9] = 'Pending Review';
+        newRow[10] = '';
+        newRow[11] = date || '';
+        newRow[12] = now;
+        sh.appendRow(newRow);
+        Logger.log(`LP_SUBMIT: Created new row with lpId ${newLpId} for ${clsStr}/${subjStr} (special case)`);
+        return _respond({ submitted: true });
+      } else {
+        Logger.log(`LP_SUBMIT: Special case NOT triggered for clsStr="${clsStr}", subjStr="${subjStr}"`);
+      }
+      
+      let placeholderLpId = null;
+      let matches = 0;
+      
+      // First pass: Look specifically for placeholder rows with matching class/subject/session
+      // completely ignoring chapter - these will be our primary update targets
+      // We'll use a priority system to choose which row to update if multiple matches
+      let bestRowIndex = -1;
+      let bestPriority = -1;  // Higher number = higher priority
+      
+      for (let i=0;i<values.length;i++) {
+        const rowClass = String(values[i][classIdx] || '').trim();
+        const rowSubj = String(values[i][subjIdx] || '').trim();
+        const rowSession = Number(values[i][sessionIdx] || 0);
+        const rowLpId = String(values[i][idIdx] || '');
+        const rowStatus = String(values[i][statusIdx] || '').trim();
+        const rowObjectives = String(values[i][objIdx] || '').trim();
+        const rowActivities = String(values[i][actIdx] || '').trim();
+  const rowChapter = String(values[i][chapterIdx] || '').trim();
+  const rowDate = String(values[i][dateIdx] || '').trim();
+        
+        // Skip rows that don't match class/subject/session/date
+        if (rowClass !== clsStr || rowSubj !== subjStr || rowSession !== sessNum || rowDate !== String(date || '')) {
+          continue;
+        }
+        
+        matches++;
+        Logger.log(`LP_SUBMIT: Found matching row ${i+2}: class:${rowClass}, subject:${rowSubj}, session:${rowSession}, lpId:${rowLpId}`);
+        
+        // Set priority based on various factors (higher = better match to update)
+        let priority = 0;
+        
+        // If this is the exact lpId, highest priority (10)
+        if (lpId && String(lpId) === rowLpId) {
+          Logger.log(`LP_SUBMIT: → Found exact matching lpId (${rowLpId}) - priority 10`);
+          priority = 10;
+        }
+        // If status is "Pending Preparation", very high priority (8)
+        else if (rowStatus === 'Pending Preparation') {
+          Logger.log(`LP_SUBMIT: → Found 'Pending Preparation' row - priority 8`);
+          priority = 8;
+        }
+        // If empty objectives AND activities, high priority (6)
+        else if (!rowObjectives && !rowActivities) {
+          Logger.log(`LP_SUBMIT: → Found row with empty content - priority 6`);
+          priority = 6;
+        }
+        // If chapter matches and empty objectives OR activities, medium priority (4)
+        else if (chapterFromScheme && rowChapter === chapterFromScheme && (!rowObjectives || !rowActivities)) {
+          Logger.log(`LP_SUBMIT: → Found row with matching chapter and partial empty content - priority 4`);
+          priority = 4;
+        }
+        // If chapter matches, low priority (2)
+        else if (chapterFromScheme && rowChapter === chapterFromScheme) {
+          Logger.log(`LP_SUBMIT: → Found row with matching chapter - priority 2`);
+          priority = 2;
+        }
+        // Any other matching row, lowest priority (1)
+        else {
+          Logger.log(`LP_SUBMIT: → Found basic matching row - priority 1`);
+          priority = 1;
+        }
+        
+        // Update our best match if this one has higher priority
+        if (priority > bestPriority) {
+          bestPriority = priority;
+          bestRowIndex = i;
+          placeholderLpId = rowLpId;
+          Logger.log(`LP_SUBMIT: → New best match: row ${i+2}, lpId ${rowLpId}, priority ${priority}`);
+          
+          // If priority is 8 or higher (exact match or Pending Preparation), stop looking
+          if (priority >= 8) break;
+        }
+      }
+      
+      // If we found a good match, set the placeholderLpId
+      if (bestRowIndex >= 0) {
+        placeholderLpId = String(values[bestRowIndex][idIdx] || '');
+        Logger.log(`LP_SUBMIT: Selected best row to update: ${bestRowIndex+2}, lpId ${placeholderLpId}, priority ${bestPriority}`);
+      }
+      
+      // Only check for strict duplicates if we haven't found a placeholder to update
+      if (!placeholderLpId) {
+        for (let i=0;i<values.length;i++) {
+          const rowClass = String(values[i][classIdx] || '').trim();
+          const rowSubj = String(values[i][subjIdx] || '').trim();
+          const rowSession = Number(values[i][sessionIdx] || 0);
+          const rowChapter = String(values[i][chapterIdx] || '').trim();
+          const rowDate = String(values[i][dateIdx] || '').trim();
+          const rowLpId = String(values[i][idIdx] || '');
+          const rowStatus = String(values[i][statusIdx] || '').trim();
+          
+          // Only check non-placeholders for duplicates (ones with content)
+      if (rowClass === clsStr && rowSubj === subjStr && rowSession === sessNum && rowDate === String(date || '') && 
+              rowStatus !== 'Pending Preparation') {
+            
+            // If chapter is known (from scheme or row) and matches, treat as duplicate
+            if (chapterFromScheme && rowChapter && rowChapter === chapterFromScheme) {
+              Logger.log(`LP_SUBMIT: → Duplicate detected - matching chapter: ${chapterFromScheme}`);
+              return _respond({ error: 'Duplicate lesson plan exists for this class/subject/session/chapter' });
+            }
+            // If both have empty chapters and same class/subject/session, treat as duplicate
+            if (!chapterFromScheme && !rowChapter) {
+              Logger.log(`LP_SUBMIT: → Duplicate detected - both have empty chapters`);
+              return _respond({ error: 'Duplicate lesson plan exists for this class/subject/session' });
+            }
+          }
+        }
+      }
+      
+      Logger.log(`LP_SUBMIT: Found ${matches} matching rows, placeholderLpId: ${placeholderLpId || 'none'}`); 
+      
+      Logger.log(`LP_SUBMIT: Found ${matches} matching rows, placeholderLpId: ${placeholderLpId || 'none'}`);
+
+      // Try to find the row by lpId (from payload) or a discovered placeholderLpId and update if found
+      Logger.log(`LP_SUBMIT: Searching for row to update, target lpId: ${lpId || 'none'}, placeholderLpId: ${placeholderLpId || 'none'}`);
+      for (let i=0;i<values.length;i++) {
+        const rowLpId = String(values[i][idIdx] || '');
+        if ((lpId && rowLpId === String(lpId)) || (placeholderLpId && rowLpId === String(placeholderLpId))) {
+          Logger.log(`LP_SUBMIT: Updating existing row at index ${i+2} with lpId ${rowLpId}`);
+          Logger.log(`LP_SUBMIT: Row details - class:${values[i][classIdx]}, subject:${values[i][subjIdx]}, session:${values[i][sessionIdx]}`);
+          Logger.log(`LP_SUBMIT: Row status: ${values[i][statusIdx]}, chapter: ${values[i][chapterIdx] || '(none)'}`);
+          Logger.log(`LP_SUBMIT: Objectives empty: ${!values[i][objIdx]}, activities empty: ${!values[i][actIdx]}`);
+          
+          values[i][objIdx] = objectives || '';
+          values[i][actIdx] = activities || '';
+          values[i][dateIdx] = date || '';
+          values[i][statusIdx] = 'Pending Review';
+          // optionally update chapter/class/subject/session if provided
+          if (clsStr) values[i][classIdx] = clsStr;
+          if (subjStr) values[i][subjIdx] = subjStr;
+          if (sessNum) values[i][sessionIdx] = sessNum;
+          if (date) values[i][dateIdx] = date;
+          if (chapterFromScheme) values[i][chapterIdx] = chapterFromScheme;
+          sh.getRange(2+i,1,1,headers.length).setValues([values[i]]);
+          Logger.log(`LP_SUBMIT: Successfully updated row. New status: ${values[i][statusIdx]}`);
+          return _respond({ submitted: true });
+        }
+      }
+
+      // If lpId not found, append a new lesson plan row (only if no duplicate detected above)
+      Logger.log(`LP_SUBMIT: No matching row found to update, creating new row`);
+      Logger.log(`LP_SUBMIT: Searched through ${values.length} rows but couldn't find a suitable row to update`);
+      Logger.log(`LP_SUBMIT: Creating new row with class:${clsStr}, subject:${subjStr}, session:${sessNum}, chapter:${chapterFromScheme || '(none)'}`);
+      
+      const now = new Date().toISOString();
+      const newLpId = lpId && String(lpId).trim() ? String(lpId).trim() : _uuid();
+      const newRow = [];
+      // Build row in the SHEETS.LessonPlans order
+      newRow[0] = newLpId; // lpId
+      newRow[1] = (teacherEmail||'').toLowerCase().trim(); // teacherEmail
+      newRow[2] = teacherName || ''; // teacherName
+      newRow[3] = clsStr; // class
+      newRow[4] = subjStr; // subject
+      newRow[5] = chapterFromScheme || ''; // chapter
+      newRow[6] = sessNum; // session
+      newRow[7] = objectives || '';
+      newRow[8] = activities || '';
+      newRow[9] = 'Pending Review'; // status
+      newRow[10] = ''; // reviewerRemarks
+      newRow[11] = date || '';
+      newRow[12] = now;
+      sh.appendRow(newRow);
+      Logger.log(`LP_SUBMIT: Successfully created new row with lpId ${newLpId}`);
+      return _respond({ submitted: true });
+    }
+
+    if (action === 'updateLessonPlanDetailsStatus') {
+      const { lpId, status, remarks } = data;
+      const sh = _getSheet('LessonPlans');
+      const headers = _headers(sh);
+      const idIdx = headers.indexOf('lpId');
+      const statusIdx = headers.indexOf('status');
+      const remarksIdx = headers.indexOf('reviewerRemarks');
+      const last = sh.getLastRow();
+      if (last < 2) return _respond({ error: 'Not found' });
+      const values = sh.getRange(2,1,last-1,headers.length).getValues();
+      for (let i=0;i<values.length;i++) {
+        if (String(values[i][idIdx]) === String(lpId)) {
+          values[i][statusIdx] = status;
+          if (remarksIdx >= 0) values[i][remarksIdx] = remarks || '';
+          sh.getRange(2+i,1,1,headers.length).setValues([values[i]]);
+          return _respond({ submitted: true });
+        }
+      }
+      return _respond({ error: 'Lesson plan not found' });
+    }
+
+    if (action === 'submitDailyReport') {
+      const sh = _getSheet('DailyReports');
+      _ensureHeaders(sh, SHEETS.DailyReports);
+      const now = new Date().toISOString();
+      sh.appendRow([
+        data.date || '',
+        data.teacherEmail || '',
+        data.teacherName || '',
+        data.class || '',
+        data.subject || '',
+        Number(data.period||0),
+        data.planType || '',
+        data.lessonPlanId || '',
+        data.chapter || '',
+        data.objectives || '',
+        data.activities || '',
+        data.completed || '',
+        data.notes || '',
+        now
+      ]);
+      return _respond({ submitted: true });
+    }
+
+    if (action === 'assignSubstitution') {
+      const sh = _getSheet('Substitutions');
+      _ensureHeaders(sh, SHEETS.Substitutions);
+      const now = new Date().toISOString();
+      sh.appendRow([
+        data.date || '',
+        Number(data.period||0),
+        data.class || '',
+        data.absentTeacher || '',
+        data.regularSubject || '',
+        data.substituteTeacher || '',
+        data.substituteSubject || '',
+        data.note || '',
+        now
+      ]);
+      return _respond({ submitted: true });
+    }
+
+    if (action === 'createExam') {
+      // Create a new exam.  The payload should include email, creatorName,
+      // class, subject, examType, internalMax, externalMax, totalMax and date.
+      const sh = _getSheet('Exams');
+      _ensureHeaders(sh, SHEETS.Exams);
+      const now = new Date().toISOString();
+      const examId = _uuid();
+      sh.appendRow([
+        examId,
+        (data.email||'').toLowerCase().trim(),
+        data.creatorName || '',
+        data.class || '',
+        data.subject || '',
+        data.examType || '',
+        Number(data.internalMax||0),
+        Number(data.externalMax||0),
+        Number(data.totalMax||0),
+        data.date || '',
+        now
+      ]);
+      // Populate ExamMarks with a placeholder row for each student in the class.
+      try {
+        const emSh = _getSheet('ExamMarks');
+        _ensureHeaders(emSh, SHEETS.ExamMarks);
+        const studentsSh = _getSheet('Students');
+        const sHeaders = _headers(studentsSh);
+        const students = _rows(studentsSh).map(r => _indexByHeader(r, sHeaders));
+        const cls = data.class || '';
+        const createdAt = new Date().toISOString();
+        students
+          .filter(s => String(s.class || '') === String(cls))
+          .forEach(s => {
+            // Append a placeholder ExamMarks row for each student. DO NOT
+            // include teacher details here; marks will be filled when a
+            // teacher submits them. This ensures the UI can show the class
+            // roster immediately after exam creation.
+            emSh.appendRow([
+              examId,
+              cls,
+              data.subject || '',
+              '', // teacherEmail (empty until submission)
+              '', // teacherName
+              s.admNo || '',
+              s.name || '',
+              '', // internal
+              '', // external
+              '', // total
+              createdAt
+            ]);
+          });
+      } catch (err) {
+        // Non-fatal: if populating ExamMarks fails, log and continue returning examId
+        // so exam creation still succeeds. Caller can populate later.
+        // Note: Apps Script logging is available via console.log or Logger.
+        try { console && console.error && console.error('Failed to populate ExamMarks:', err); } catch (e) {}
+      }
+  return _respond({ submitted: true });
+    }
+
+    if (action === 'submitExamMarks') {
+      // Submit marks for a given exam.  The payload includes examId,
+      // class, subject, teacherEmail, teacherName and an array of marks.
+      const examId = data.examId || '';
+      const cls = data.class || '';
+      const subject = data.subject || '';
+      const teacherEmail = (data.teacherEmail||'').toLowerCase().trim();
+      const teacherName = data.teacherName || '';
+      const marks = Array.isArray(data.marks) ? data.marks : [];
+      if (!examId) return _respond({ error: 'Missing examId' });
+      const sh = _getSheet('ExamMarks');
+      _ensureHeaders(sh, SHEETS.ExamMarks);
+      const now = new Date().toISOString();
+
+      // Read existing rows so we can update (upsert) instead of always appending.
+      const headers = _headers(sh);
+      const last = sh.getLastRow();
+      let values = [];
+      if (last >= 2) {
+        values = sh.getRange(2, 1, last - 1, headers.length).getValues();
+      }
+
+      const examIdIdx = headers.indexOf('examId');
+      const admNoIdx = headers.indexOf('admNo');
+      const internalIdx = headers.indexOf('internal');
+      const externalIdx = headers.indexOf('external');
+      const totalIdx = headers.indexOf('total');
+      const teacherEmailIdx = headers.indexOf('teacherEmail');
+      const teacherNameIdx = headers.indexOf('teacherName');
+      const createdAtIdx = headers.indexOf('createdAt');
+
+      // For each incoming mark, try to find an existing row for same examId and admNo
+      marks.forEach(m => {
+        const adm = String(m.admNo || '');
+        const name = String(m.studentName || '');
+        const internal = Number(m.internal || 0);
+        const external = Number(m.external || 0);
+        const total = internal + external;
+
+        let found = -1;
+        for (let i = 0; i < values.length; i++) {
+          const rowExamId = String(values[i][examIdIdx] || '');
+          const rowAdm = String(values[i][admNoIdx] || '');
+          const rowName = String(values[i][headers.indexOf('studentName')] || '');
+          if (rowExamId === String(examId) && rowAdm && adm && rowAdm === adm) {
+            found = i;
+            break;
+          }
+        }
+
+        // If not found by admNo, try matching by studentName (case-insensitive)
+        if (found === -1 && name) {
+          for (let i = 0; i < values.length; i++) {
+            const rowExamId = String(values[i][examIdIdx] || '');
+            const rowName = String(values[i][headers.indexOf('studentName')] || '');
+            if (rowExamId === String(examId) && rowName && rowName.toLowerCase() === name.toLowerCase()) {
+              found = i;
+              break;
+            }
+          }
+        }
+
+        if (found >= 0) {
+          // Update the in-memory values array; we'll write back the block later.
+          values[found][internalIdx] = internal;
+          values[found][externalIdx] = external;
+          values[found][totalIdx] = total;
+          if (teacherEmailIdx >= 0) values[found][teacherEmailIdx] = teacherEmail;
+          if (teacherNameIdx >= 0) values[found][teacherNameIdx] = teacherName;
+          if (createdAtIdx >= 0) values[found][createdAtIdx] = now;
+        } else {
+          // No existing row: append a new row
+          sh.appendRow([
+            examId,
+            cls,
+            subject,
+            teacherEmail,
+            teacherName,
+            m.admNo || '',
+            m.studentName || '',
+            internal,
+            external,
+            total,
+            now
+          ]);
+        }
+      });
+
+      // Write back any updates we made to the existing block of rows
+      if (values.length > 0) {
+        sh.getRange(2, 1, values.length, headers.length).setValues(values);
+      }
+
+      return _respond({ submitted: true });
+    }
+
+    if (action === 'submitAttendance') {
+      // Record attendance for a class on a given date.  The payload should
+      // include date, class, teacherEmail, teacherName and an array of
+      // attendance records ({ admNo, studentName, status }).  Each record is
+      // appended to the Attendance sheet.
+      const { date, class: cls, teacherEmail, teacherName, records } = data;
+      const recs = Array.isArray(records) ? records : [];
+      const sh = _getSheet('Attendance');
+      _ensureHeaders(sh, SHEETS.Attendance);
+      const now = new Date().toISOString();
+      recs.forEach(r => {
+        sh.appendRow([
+          date || '',
+          cls || '',
+          r.admNo || '',
+          r.studentName || '',
+          r.status || '',
+          (teacherEmail||'').toLowerCase().trim(),
+          teacherName || '',
+          now
+        ]);
+      });
+      return _respond({ submitted: true });
+    }
+    
+    if (action === 'saveCalendarEvent') {
+      // Save a personal calendar event
+      // Required data fields: userEmail, title, startTime, endTime
+      // Optional fields: class, subject, notes, type, color, allDay
+      const sh = _getSheet('CalendarEvents');
+      _ensureHeaders(sh, SHEETS.CalendarEvents);
+      const now = new Date().toISOString();
+      const eventId = data.eventId || _uuid();
+      
+      // Check if this is an update to existing event
+      if (data.eventId) {
+        const headers = _headers(sh);
+        const idIdx = headers.indexOf('eventId');
+        const last = sh.getLastRow();
+        if (last >= 2) {
+          const values = sh.getRange(2, 1, last - 1, headers.length).getValues();
+          
+          for (let i = 0; i < values.length; i++) {
+            if (String(values[i][idIdx]) === String(eventId)) {
+              // Found existing event, update it
+              const row = [];
+              for (let j = 0; j < headers.length; j++) {
+                const field = headers[j];
+                if (field === 'eventId') {
+                  row.push(eventId);
+                } else if (field === 'createdAt') {
+                  row.push(values[i][j] || now); // Keep original creation date
+                } else if (data[field] !== undefined) {
+                  row.push(data[field]);
+                } else {
+                  row.push(values[i][j] || ''); // Keep existing value
+                }
+              }
+              
+              sh.getRange(i + 2, 1, 1, headers.length).setValues([row]);
+              return _respond({ saved: true, eventId });
+            }
+          }
+        }
+      }
+      
+      // If not found or new event, create a new row
+      sh.appendRow([
+        eventId,
+        (data.userEmail || '').toLowerCase().trim(),
+        data.title || 'Untitled Event',
+        data.startTime || now,
+        data.endTime || now,
+        data.class || '',
+        data.subject || '',
+        data.notes || '',
+        data.type || 'personal',
+        data.color || '#8b5cf6', // Default purple for personal events
+        data.allDay === true ? 'true' : 'false',
+        now
+      ]);
+      
+      return _respond({ saved: true, eventId });
+    }
+    
+    if (action === 'deleteCalendarEvent') {
+      // Delete a personal calendar event by ID
+      const eventId = data.eventId;
+      if (!eventId) return _respond({ error: 'Missing eventId' });
+      
+      const sh = _getSheet('CalendarEvents');
+      const headers = _headers(sh);
+      const idIdx = headers.indexOf('eventId');
+      const last = sh.getLastRow();
+      
+      if (last < 2) return _respond({ error: 'No events found' });
+      
+      const values = sh.getRange(2, 1, last - 1, headers.length).getValues();
+      for (let i = 0; i < values.length; i++) {
+        if (String(values[i][idIdx]) === String(eventId)) {
+          // Found the event, delete the row
+          sh.deleteRow(i + 2);
+          return _respond({ deleted: true });
+        }
+      }
+      
+      return _respond({ error: 'Event not found' });
+    }
+
+    return _respond({ error: 'Unknown action' });
+  } catch (err) {
+    return _respond({ error: String(err && err.message ? err.message : err) });
+  }
+}
+
+/**
+ * TEST FUNCTIONS - Use these in Apps Script editor to verify functionality
+ */
+
+/**
+ * Test the substitution workflow manually
+ * Run this function in Apps Script editor to verify everything works
+ */
+function testSubstitutionWorkflow() {
+  try {
+    console.log('=== Testing Substitution Workflow ===');
+    
+    // Test 1: Get potential absent teachers
+    console.log('1. Testing getPotentialAbsentTeachers...');
+    const e1 = { parameter: { action: 'getPotentialAbsentTeachers' } };
+    const teachers = JSON.parse(doGet(e1).getContent());
+    console.log('Potential absent teachers:', teachers);
+    
+    if (!teachers || teachers.length === 0) {
+      throw new Error('No teachers found in Users sheet');
+    }
+    
+    // Test 2: Get teacher daily timetable for today (Friday)
+    console.log('2. Testing getTeacherDailyTimetable...');
+    const testDate = '2025-10-03'; // Friday
+    const testTeacher = teachers[0]; // Use first teacher
+    const teacherIdentifier = testTeacher.email || testTeacher.name;
+    console.log('Testing with teacher:', testTeacher, 'on date:', testDate);
+    
+    const e2 = { parameter: { action: 'getTeacherDailyTimetable', email: teacherIdentifier, date: testDate } };
+    const timetable = JSON.parse(doGet(e2).getContent());
+    console.log('Teacher timetable:', timetable);
+    
+    // Test 3: Get free teachers for a specific period
+    if (timetable && timetable.length > 0) {
+      console.log('3. Testing getFreeTeachers...');
+      const testPeriod = timetable[0].period;
+      const e3 = { 
+        parameter: { 
+          action: 'getFreeTeachers', 
+          date: testDate, 
+          period: testPeriod,
+          absent: [teacherIdentifier]
+        } 
+      };
+      const freeTeachers = JSON.parse(doGet(e3).getContent());
+      console.log(`Free teachers for period ${testPeriod}:`, freeTeachers);
+    }
+    
+    // Test 4: Day name normalization
+    console.log('4. Testing day name normalization...');
+    const dayName = _dayName(testDate);
+    const normalized = _normalizeDayName(dayName);
+    console.log(`Date: ${testDate}, Day: ${dayName}, Normalized: ${normalized}`);
+    
+    console.log('=== All tests completed successfully! ===');
+    return 'Tests passed!';
+    
+  } catch (error) {
+    console.error('Test failed:', error);
+    return `Test failed: ${error.message}`;
+  }
+}
+
+/**
+ * Quick test to verify your spreadsheet data
+ */
+function testSpreadsheetData() {
+  try {
+    console.log('=== Testing Spreadsheet Data ===');
+    
+    // Test Users sheet
+    const usersSh = _getSheet('Users');
+    const usersHeaders = _headers(usersSh);
+    const usersData = _rows(usersSh);
+    console.log('Users sheet headers:', usersHeaders);
+    console.log('Users count:', usersData.length);
+    if (usersData.length > 0) {
+      console.log('Sample user:', _indexByHeader(usersData[0], usersHeaders));
+    }
+    
+    // Test Timetable sheet
+    const timetableSh = _getSheet('Timetable');
+    const timetableHeaders = _headers(timetableSh);
+    const timetableData = _rows(timetableSh);
+    console.log('Timetable sheet headers:', timetableHeaders);
+    console.log('Timetable entries count:', timetableData.length);
+    if (timetableData.length > 0) {
+      console.log('Sample timetable entry:', _indexByHeader(timetableData[0], timetableHeaders));
+    }
+    
+    return 'Spreadsheet data check completed!';
+    
+  } catch (error) {
+    console.error('Spreadsheet test failed:', error);
+    return `Spreadsheet test failed: ${error.message}`;
+  }
+}
+
+// Removed duplicate _parsePost and doPost to prevent overriding the main POST handler above.

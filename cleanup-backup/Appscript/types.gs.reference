@@ -1,0 +1,167 @@
+/**
+ * TypeScript-like definitions for SchoolFlow user management
+ * These serve as documentation for the expected data structures
+ */
+
+/**
+ * User data structure
+ * @typedef {Object} User
+ * @property {string} email - User's email address
+ * @property {string} name - User's full name
+ * @property {string} [password] - User's password (optional in some contexts)
+ * @property {string} roles - Comma-separated list of user roles
+ * @property {string} [classes] - Classes assigned to teacher
+ * @property {string} [subjects] - Subjects taught by teacher
+ * @property {string} [classTeacherFor] - Class for which user is class teacher
+ */
+
+/**
+ * Response format for API functions
+ * @typedef {Object} ApiResponse
+ * @property {boolean} success - Whether the operation was successful
+ * @property {string} [message] - Success message
+ * @property {string} [error] - Error message if operation failed
+ */
+
+/**
+ * Role validation result
+ * @typedef {Object} RoleValidationResult
+ * @property {boolean} valid - Whether all roles are valid
+ * @property {string[]} roles - List of valid roles
+ * @property {string[]} [invalidRoles] - List of invalid roles if any
+ */
+
+/**
+ * Helper functions (already implemented elsewhere)
+ */
+function _getSheet(name) {
+  // Implementation exists in another file
+  return null;
+}
+
+function _headers(sh) {
+  // Implementation exists in another file
+  return [];
+}
+
+function _rows(sh) {
+  // Implementation exists in another file
+  return [[]];
+}
+
+function _indexByHeader(row, headers) {
+  // Implementation exists in another file
+  return {};
+}
+
+function _bootstrapSheets() {
+  // Implementation exists in another file
+}
+
+function _hashPassword(password) {
+  // Implementation exists in another file
+  return "";
+}
+
+/**
+ * Valid roles for the application - defined in RoleUtils.gs
+ * @see RoleUtils.gs
+ */
+// VALID_ROLES is defined in RoleUtils.gs
+
+/**
+ * Validates a comma-separated string of roles
+ * @param {string} rolesString - Comma-separated roles
+ * @return {RoleValidationResult} Validation result
+ */
+function validateRoles(rolesString) {
+  // Implementation exists in RoleUtils.gs
+  return { valid: false, roles: [] };
+}
+
+/**
+ * Checks if a user has a specific role
+ * @param {string|string[]} userRoles - User's roles as string or array
+ * @param {string} roleToCheck - Role to check for
+ * @return {boolean} True if user has the role
+ */
+function hasRole(userRoles, roleToCheck) {
+  // Implementation exists in RoleUtils.gs
+  return false;
+}
+
+/**
+ * Gets readable labels for roles
+ * @param {string|string[]} roles - Roles as string or array
+ * @return {string[]} Human-readable role labels
+ */
+function getRoleLabels(roles) {
+  // Implementation exists in RoleUtils.gs
+  return [];
+}
+
+/**
+ * Adds a new user to the system
+ * @param {string} email - User's email
+ * @param {string} name - User's name
+ * @param {string} password - User's password (will be hashed)
+ * @param {string} [roles] - User's roles (comma-separated)
+ * @param {string} [classes] - Classes assigned to teacher
+ * @param {string} [subjects] - Subjects taught by teacher
+ * @param {string} [classTeacherFor] - Class for which user is class teacher
+ * @return {ApiResponse} Operation result
+ */
+function addUser(email, name, password, roles, classes, subjects, classTeacherFor) {
+  // Implementation exists in UserManagement.gs
+  return { success: false };
+}
+
+/**
+ * Updates a user's password
+ * @param {string} email - User's email
+ * @param {string} newPassword - New password (will be hashed)
+ * @return {ApiResponse} Operation result
+ */
+function updateUserPassword(email, newPassword) {
+  // Implementation exists in UserManagement.gs
+  return { success: false };
+}
+
+/**
+ * Lists all users in the system
+ * @return {User[]} Array of user objects
+ */
+function listAllUsers() {
+  // Implementation exists in UserManagement.gs
+  return [];
+}
+
+/**
+ * Removes a user from the system
+ * @param {string} email - Email of user to remove
+ * @return {ApiResponse} Operation result
+ */
+function removeUser(email) {
+  // Implementation exists in UserManagement.gs
+  return { success: false };
+}
+
+/**
+ * Creates sample users for testing
+ * @return {ApiResponse} Operation result
+ */
+function createSampleUsers() {
+  // Implementation exists in UserManagement.gs
+  return { success: false };
+}
+
+/**
+ * Tests login credentials
+ * @param {string} email - User's email
+ * @param {string} password - User's password
+ * @return {ApiResponse} Operation result with user data if successful
+ */
+function testLogin(email, password) {
+  // Implementation exists in UserManagement.gs
+  return { success: false };
+}

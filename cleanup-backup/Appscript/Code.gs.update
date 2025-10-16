@@ -1,0 +1,345 @@
+// ===== ADD THIS FUNCTION TO YOUR CODE.GS FILE =====
+/**
+ * Parse POST request body data into JavaScript object.
+ * Returns empty object if parsing fails.
+ */
+function _parsePost(e) {
+  try {
+    if (e.postData && e.postData.contents) {
+      return JSON.parse(e.postData.contents);
+    }
+  } catch (err) {
+    console.error("Error parsing POST data:", err);
+  }
+  return {};
+}
+
+// ===== ADD THIS FUNCTION TO YOUR CODE.GS FILE =====
+/**
+ * Exchange Google ID token for application user profile/roles.
+ * Expects payload: { idToken }
+ * Validates token via Google tokeninfo endpoint, then maps email to Users sheet.
+ */
+function _handleGoogleLogin(payload) {
+  if (!payload || !payload.idToken) {
+    return _respond({ error: 'Missing idToken' });
+  }
+  try {
+    const url = 'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(payload.idToken);
+    const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (resp.getResponseCode() !== 200) {
+      return _respond({ error: 'Invalid Google token' });
+    }
+    const info = JSON.parse(resp.getContentText());
+    const verified = String(info.email_verified || info.emailVerified || '').toLowerCase();
+    if (verified !== 'true') {
+      return _respond({ error: 'Email not verified' });
+    }
+    const email = String(info.email || '').toLowerCase().trim();
+    if (!email) {
+      return _respond({ error: 'Token missing email' });
+    }
+
+    // Lookup user in Users sheet
+    const sh = _getSheet('Users');
+    const headers = _headers(sh);
+    const list = _rows(sh).map(r => _indexByHeader(r, headers));
+    const found = list.find(u => String(u.email || '').toLowerCase() === email);
+    if (!found) {
+      return _respond({ error: 'User not registered' });
+    }
+
+    // Normalize roles/classes/subjects
+    const roleStr = (found.roles || found.role || '').toString();
+    const roles = roleStr.split(',').map(s => s.trim()).filter(Boolean);
+    const classStr = (found.classes || found.Class || found.Classes || '').toString();
+    const classes = classStr.split(',').map(s => s.trim()).filter(Boolean);
+    const subjStr = (found.subjects || found.Subject || found.Subjects || '').toString();
+    const subjects = subjStr.split(',').map(s => s.trim()).filter(Boolean);
+    const classTeacherFor = found.classTeacherFor || found['Class Teacher For'] || '';
+
+    return _respond({
+      email,
+      name: found.name || info.name || '',
+      roles,
+      classes,
+      subjects,
+      classTeacherFor,
+      picture: info.picture || ''
+    });
+  } catch (err) {
+    return _respond({ error: 'googleLogin failed: ' + (err && err.message ? err.message : err) });
+  }
+}
+
+// ===== ADD THIS FUNCTION TO YOUR CODE.GS FILE =====
+/**
+ * Handle POST requests - supports actions like googleLogin, submitPlan, updatePlanStatus, etc.
+ */
+function doPost(e) {
+  const action = (e.parameter.action || '').trim();
+  const data = _parsePost(e);
+  try {
+    _bootstrapSheets();
+    
+    // Handle Google login via POST
+    if (action === 'googleLogin') {
+      return _handleGoogleLogin(data);
+    }
+    
+    // Add handlers for other POST actions below
+    if (action === 'submitPlan') {
+      const email = (data.email || '').toLowerCase().trim();
+      const planData = data;
+      
+      // Get a reference to the Schemes sheet
+      const sh = _getSheet('Schemes');
+      const headers = _headers(sh);
+      
+      // Generate a unique ID for this scheme
+      const schemeId = Utilities.getUuid();
+      
+      // Get the values from the submitted data
+      const teacherName = planData.teacherName || '';
+      const cls = planData.class || '';
+      const subject = planData.subject || '';
+      const chapter = planData.chapter || '';
+      const month = planData.month || '';
+      const term = planData.term || '';
+      const unit = planData.unit || '';
+      const noOfSessions = planData.noOfSessions || 1;
+      const status = 'Pending';  // Always start as pending
+      
+      // Create a new row with the scheme data
+      const newRow = headers.map(h => {
+        if (h === 'schemeId') return schemeId;
+        if (h === 'teacherEmail') return email;
+        if (h === 'teacherName') return teacherName;
+        if (h === 'class') return cls;
+        if (h === 'subject') return subject;
+        if (h === 'chapter') return chapter;
+        if (h === 'month') return month;
+        if (h === 'term') return term;
+        if (h === 'unit') return unit;
+        if (h === 'noOfSessions') return noOfSessions;
+        if (h === 'status') return status;
+        if (h === 'createdAt') return new Date().toISOString();
+        return '';
+      });
+      
+      // Append the new row to the sheet
+      sh.appendRow(newRow);
+      
+      return _respond({ ok: true, schemeId });
+    }
+    
+    if (action === 'updatePlanStatus') {
+      const schemeId = String(data.schemeId || '').trim();
+      const newStatus = String(data.status || '').trim();
+      
+      if (!schemeId) {
+        return _respond({ error: 'Missing scheme ID' });
+      }
+      
+      if (!newStatus || !['Approved', 'Rejected', 'Pending'].includes(newStatus)) {
+        return _respond({ error: 'Invalid status. Must be Approved, Rejected or Pending.' });
+      }
+      
+      // Get the Schemes sheet
+      const sh = _getSheet('Schemes');
+      const headers = _headers(sh);
+      const idCol = headers.indexOf('schemeId');
+      const statusCol = headers.indexOf('status');
+      
+      if (idCol === -1 || statusCol === -1) {
+        return _respond({ error: 'Sheet missing required columns' });
+      }
+      
+      // Find the row with the matching schemeId
+      const data = sh.getDataRange().getValues();
+      for (let i = 1; i < data.length; i++) {
+        if (String(data[i][idCol]) === schemeId) {
+          // Update the status
+          sh.getRange(i + 1, statusCol + 1).setValue(newStatus);
+          return _respond({ ok: true });
+        }
+      }
+      
+      return _respond({ error: 'Scheme not found' });
+    }
+
+    if (action === 'submitLessonPlanDetails') {
+      const lpId = String(data.lpId || '').trim();
+      
+      if (!lpId) {
+        return _respond({ error: 'Missing lesson plan ID' });
+      }
+      
+      // Get the LessonPlans sheet
+      const sh = _getSheet('LessonPlans');
+      const headers = _headers(sh);
+      const idCol = headers.indexOf('lpId');
+      
+      if (idCol === -1) {
+        return _respond({ error: 'Sheet missing required columns' });
+      }
+      
+      // Process the incoming data to extract fields
+      const { objectives, activities, resources, evaluation, homework, remarks, status } = data;
+      
+      // Find the row with the matching lpId
+      const sheetData = sh.getDataRange().getValues();
+      for (let i = 1; i < sheetData.length; i++) {
+        if (String(sheetData[i][idCol]) === lpId) {
+          // Update the relevant columns
+          for (const [key, value] of Object.entries({ 
+            objectives, activities, resources, evaluation, homework, remarks,
+            status: status || 'Pending Review'
+          })) {
+            const colIndex = headers.indexOf(key);
+            if (colIndex !== -1 && value !== undefined) {
+              sh.getRange(i + 1, colIndex + 1).setValue(value);
+            }
+          }
+          
+          // Also update the lastModified timestamp
+          const modifiedCol = headers.indexOf('lastModified');
+          if (modifiedCol !== -1) {
+            sh.getRange(i + 1, modifiedCol + 1).setValue(new Date().toISOString());
+          }
+          
+          return _respond({ ok: true });
+        }
+      }
+      
+      return _respond({ error: 'Lesson plan not found' });
+    }
+
+    if (action === 'updateLessonPlanDetailsStatus') {
+      const lpId = String(data.lpId || '').trim();
+      const newStatus = String(data.status || '').trim();
+      const remarks = String(data.remarks || '').trim();
+      
+      if (!lpId) {
+        return _respond({ error: 'Missing lesson plan ID' });
+      }
+      
+      if (!newStatus) {
+        return _respond({ error: 'Missing status' });
+      }
+      
+      // Get the LessonPlans sheet
+      const sh = _getSheet('LessonPlans');
+      const headers = _headers(sh);
+      const idCol = headers.indexOf('lpId');
+      const statusCol = headers.indexOf('status');
+      const remarksCol = headers.indexOf('remarks');
+      
+      if (idCol === -1 || statusCol === -1) {
+        return _respond({ error: 'Sheet missing required columns' });
+      }
+      
+      // Find the row with the matching lpId
+      const sheetData = sh.getDataRange().getValues();
+      for (let i = 1; i < sheetData.length; i++) {
+        if (String(sheetData[i][idCol]) === lpId) {
+          // Update the status
+          sh.getRange(i + 1, statusCol + 1).setValue(newStatus);
+          
+          // Update remarks if the column exists
+          if (remarksCol !== -1 && remarks) {
+            sh.getRange(i + 1, remarksCol + 1).setValue(remarks);
+          }
+          
+          return _respond({ ok: true });
+        }
+      }
+      
+      return _respond({ error: 'Lesson plan not found' });
+    }
+
+    if (action === 'submitDailyReport') {
+      const { 
+        date, class: cls, subject, period, teacherEmail, teacherName,
+        chapter, activity, homework, remarks, attendanceCount, absentCount
+      } = data;
+      
+      if (!date || !cls || !subject || !period || !teacherEmail) {
+        return _respond({ error: 'Missing required fields' });
+      }
+      
+      // Generate a unique ID for this report
+      const reportId = Utilities.getUuid();
+      
+      // Get the DailyReports sheet
+      const sh = _getSheet('DailyReports');
+      const headers = _headers(sh);
+      
+      // Create a new row with the report data
+      const newRow = headers.map(h => {
+        if (h === 'reportId') return reportId;
+        if (h === 'date') return date;
+        if (h === 'class') return cls;
+        if (h === 'subject') return subject;
+        if (h === 'period') return period;
+        if (h === 'teacherEmail') return teacherEmail;
+        if (h === 'teacherName') return teacherName || '';
+        if (h === 'chapter') return chapter || '';
+        if (h === 'activity') return activity || '';
+        if (h === 'homework') return homework || '';
+        if (h === 'remarks') return remarks || '';
+        if (h === 'attendanceCount') return attendanceCount || 0;
+        if (h === 'absentCount') return absentCount || 0;
+        if (h === 'createdAt') return new Date().toISOString();
+        return '';
+      });
+      
+      // Append the new row to the sheet
+      sh.appendRow(newRow);
+      
+      return _respond({ ok: true, reportId });
+    }
+
+    if (action === 'assignSubstitution') {
+      const { 
+        date, period, absentTeacher, substituteTeacher, class: cls, 
+        regularSubject, substituteSubject, remarks 
+      } = data;
+      
+      if (!date || !period || !absentTeacher || !substituteTeacher || !cls) {
+        return _respond({ error: 'Missing required fields' });
+      }
+      
+      // Generate a unique ID for this substitution
+      const subId = Utilities.getUuid();
+      
+      // Get the Substitutions sheet
+      const sh = _getSheet('Substitutions');
+      const headers = _headers(sh);
+      
+      // Create a new row with the substitution data
+      const newRow = headers.map(h => {
+        if (h === 'subId') return subId;
+        if (h === 'date') return date;
+        if (h === 'period') return period;
+        if (h === 'absentTeacher') return absentTeacher;
+        if (h === 'substituteTeacher') return substituteTeacher;
+        if (h === 'class') return cls;
+        if (h === 'regularSubject') return regularSubject || '';
+        if (h === 'substituteSubject') return substituteSubject || regularSubject || '';
+        if (h === 'remarks') return remarks || '';
+        if (h === 'createdAt') return new Date().toISOString();
+        return '';
+      });
+      
+      // Append the new row to the sheet
+      sh.appendRow(newRow);
+      
+      return _respond({ ok: true, subId });
+    }
+    
+    return _respond({ error: 'Unknown POST action' });
+  } catch (err) {
+    return _respond({ error: String(err && err.message ? err.message : err) });
+  }
+}
