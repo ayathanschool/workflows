@@ -265,12 +265,11 @@ const SHEETS = {
   // Columns: examId – unique ID; creatorEmail – the email of the user who created
   //   the exam; creatorName – the name of the creator; class – the class for which
   //   the exam is conducted; subject – the subject; examType – e.g. Midterm,
-  //   Final, Quiz; hasInternalMarks – boolean flag if exam has internal marks;
-  //   internalMax – maximum marks for the internal component;
+  //   Final, Quiz; internalMax – maximum marks for the internal component;
   //   externalMax – maximum marks for the external component; totalMax – the
   //   total marks (internalMax + externalMax); date – the exam date; createdAt –
-  //   timestamp of record creation; examName - descriptive name in format "ExamType - Class - Subject".
-  Exams: ['examId','creatorEmail','creatorName','class','subject','examType','hasInternalMarks','internalMax','externalMax','totalMax','date','createdAt','examName'],
+  //   timestamp of record creation.
+  Exams: ['examId','creatorEmail','creatorName','class','subject','examType','internalMax','externalMax','totalMax','date','createdAt'],
   // ExamMarks: stores individual student marks for a given exam.  Columns:
   //   examId – reference to Exams.examId; class – class name; subject – subject;
   //   teacherEmail – email of the teacher submitting marks; teacherName – their name;
@@ -1482,24 +1481,18 @@ function doGet(e) {
       if (cls) filtered = filtered.filter(ex => String(ex.class||'') === cls);
       if (subject) filtered = filtered.filter(ex => String(ex.subject||'') === subject);
       if (examType) filtered = filtered.filter(ex => String(ex.examType||'') === examType);
-      const result = filtered.map(ex => {
-        // Generate exam name if it doesn't exist in the data (for backward compatibility)
-        const examName = ex.examName || `${ex.examType || 'Exam'} - ${ex.class || ''} - ${ex.subject || ''}`;
-        
-        return {
-          examId: String(ex.examId||''),
-          creatorEmail: String(ex.creatorEmail||''),
-          creatorName: String(ex.creatorName||''),
-          class: String(ex.class||''),
-          subject: String(ex.subject||''),
-          examType: String(ex.examType||''),
-          internalMax: Number(ex.internalMax||0),
-          externalMax: Number(ex.externalMax||0),
-          totalMax: Number(ex.totalMax||0),
-          date: String(ex.date||''),
-          examName: examName
-        };
-      });
+      const result = filtered.map(ex => ({
+        examId: String(ex.examId||''),
+        creatorEmail: String(ex.creatorEmail||''),
+        creatorName: String(ex.creatorName||''),
+        class: String(ex.class||''),
+        subject: String(ex.subject||''),
+        examType: String(ex.examType||''),
+        internalMax: Number(ex.internalMax||0),
+        externalMax: Number(ex.externalMax||0),
+        totalMax: Number(ex.totalMax||0),
+        date: String(ex.date||'')
+      }));
       return _respond(result);
     }
 
@@ -2330,12 +2323,7 @@ function doPost(e) {
 
       const clsStr = String(cls || '').trim();
       const subjStr = String(subject || '').trim();
-      
-      // IMPORTANT FIX: Ensure session number is properly converted to a number
-      // and never gets lost in the process
       const sessNum = Number(session || 0);
-      
-      Logger.log(`LP_SUBMIT: Using normalized values - class:"${clsStr}", subject:"${subjStr}", session:${sessNum}`);
       
       // DEBUG HELPER: Show all rows with matching class/subject/session to see why we're not finding them
       Logger.log(`LP_SUBMIT: DEBUG - Showing all rows matching class:${clsStr}, subject:${subjStr}, session:${sessNum}`);
@@ -2356,36 +2344,12 @@ function doPost(e) {
           Logger.log(`  - activities: "${values[i][actIdx] || '(empty)'}"}`);
         }
       }
-      
-      // If explicit lpId is provided, search for that specific row to update first
-      if (lpId) {
-        Logger.log(`LP_SUBMIT: Looking for exact lpId match: ${lpId}`);
-        for (let i=0; i<values.length; i++) {
-          const rowLpId = String(values[i][idIdx] || '');
-          if (rowLpId === String(lpId)) {
-            Logger.log(`LP_SUBMIT: Updating existing row with lpId ${lpId} at position ${i+2}`);
-            values[i][objIdx] = objectives || '';
-            values[i][actIdx] = activities || '';
-            values[i][dateIdx] = date || '';
-            values[i][statusIdx] = 'Pending Review';
-            // IMPORTANT FIX: Always update the session number if provided
-            if (sessNum > 0) {
-              values[i][sessionIdx] = sessNum;
-              Logger.log(`LP_SUBMIT: Setting session to ${sessNum} for row ${i+2}`);
-            }
-            // Update other fields if provided
-            if (clsStr) values[i][classIdx] = clsStr;
-            if (subjStr) values[i][subjIdx] = subjStr;
-            if (chapterFromScheme) values[i][chapterIdx] = chapterFromScheme;
-            
-            sh.getRange(2+i,1,1,headers.length).setValues([values[i]]);
-            Logger.log(`LP_SUBMIT: Successfully updated row with lpId ${lpId}`);
-            return _respond({ submitted: true });
-          }
-        }
-        Logger.log(`LP_SUBMIT: No existing row found with lpId ${lpId}`);
-      }
 
+      // UPDATED LOGIC: First look for any placeholder rows for the class/subject/session
+      // and prefer updating those instead of creating duplicates
+      Logger.log(`LP_SUBMIT: Checking for placeholders/duplicates, total rows: ${values.length}`);
+      Logger.log(`LP_SUBMIT: Looking for class:${clsStr}, subject:${subjStr}, session:${sessNum}, chapter:${chapterFromScheme || '(none)'}`);
+      
       // SPECIAL CASE: For STD 7A/English submissions, completely bypass duplicate detection and always create new rows
       // REMOVE THIS AFTER TESTING IS COMPLETE
       Logger.log(`LP_SUBMIT: Checking special case: clsStr="${clsStr}", subjStr="${subjStr}"`);
@@ -2397,8 +2361,23 @@ function doPost(e) {
       if ((clsStr === 'STD  7A' || clsStr === 'STD 7A') && subjStr === 'English') {
         Logger.log(`LP_SUBMIT: *** SPECIAL CASE *** Bypassing duplicate detection for ${clsStr}/${subjStr}`);
         Logger.log(`LP_SUBMIT: *** SPECIAL CASE *** clsStr: "${clsStr}", subjStr: "${subjStr}", sessNum: ${sessNum}`);
-        
-        // Create a new row for special case
+        // If lpId is provided, try to update that specific row, otherwise create a new row
+        if (lpId) {
+          for (let i=0; i<values.length; i++) {
+            if (String(values[i][idIdx] || '') === String(lpId)) {
+              Logger.log(`LP_SUBMIT: Found matching lpId ${lpId} at row ${i+2} - will update this row`);
+              values[i][objIdx] = objectives || '';
+              values[i][actIdx] = activities || '';
+              values[i][dateIdx] = date || '';
+              values[i][statusIdx] = 'Pending Review';
+              sh.getRange(2+i,1,1,headers.length).setValues([values[i]]);
+              Logger.log(`LP_SUBMIT: Updated row ${i+2} with new values`);
+              return _respond({ submitted: true });
+            }
+          }
+        }
+
+        // If no lpId or no matching row found, create a new row
         const now = new Date().toISOString();
         const newLpId = _uuid();
         const newRow = [];
@@ -2408,7 +2387,7 @@ function doPost(e) {
         newRow[3] = clsStr;
         newRow[4] = subjStr;
         newRow[5] = chapterFromScheme || '';
-        newRow[6] = sessNum; // IMPORTANT FIX: Explicitly assign the session number
+        newRow[6] = sessNum;
         newRow[7] = objectives || '';
         newRow[8] = activities || '';
         newRow[9] = 'Pending Review';
@@ -2416,62 +2395,156 @@ function doPost(e) {
         newRow[11] = date || '';
         newRow[12] = now;
         sh.appendRow(newRow);
-        Logger.log(`LP_SUBMIT: Created new row with lpId ${newLpId} for ${clsStr}/${subjStr} with session ${sessNum} (special case)`);
+        Logger.log(`LP_SUBMIT: Created new row with lpId ${newLpId} for ${clsStr}/${subjStr} (special case)`);
         return _respond({ submitted: true });
       } else {
         Logger.log(`LP_SUBMIT: Special case NOT triggered for clsStr="${clsStr}", subjStr="${subjStr}"`);
       }
-
-      // Search for a matching placeholder row based on class/subject/session combination
-      Logger.log(`LP_SUBMIT: Looking for matching placeholder with class:${clsStr}, subject:${subjStr}, session:${sessNum}`);
-      for (let i=0; i<values.length; i++) {
+      
+      let placeholderLpId = null;
+      let matches = 0;
+      
+      // First pass: Look specifically for placeholder rows with matching class/subject/session
+      // completely ignoring chapter - these will be our primary update targets
+      // We'll use a priority system to choose which row to update if multiple matches
+      let bestRowIndex = -1;
+      let bestPriority = -1;  // Higher number = higher priority
+      
+      for (let i=0;i<values.length;i++) {
         const rowClass = String(values[i][classIdx] || '').trim();
         const rowSubj = String(values[i][subjIdx] || '').trim();
         const rowSession = Number(values[i][sessionIdx] || 0);
+        const rowLpId = String(values[i][idIdx] || '');
         const rowStatus = String(values[i][statusIdx] || '').trim();
+        const rowObjectives = String(values[i][objIdx] || '').trim();
+        const rowActivities = String(values[i][actIdx] || '').trim();
+  const rowChapter = String(values[i][chapterIdx] || '').trim();
+  const rowDate = String(values[i][dateIdx] || '').trim();
         
-        // Check for a placeholder (empty or Pending Preparation) with matching class, subject, session
-        if (rowClass === clsStr && 
-            rowSubj === subjStr && 
-            rowSession === sessNum &&
-            (rowStatus === 'Pending Preparation' || !values[i][objIdx] || !values[i][actIdx])) {
+        // Skip rows that don't match class/subject/session/date
+        if (rowClass !== clsStr || rowSubj !== subjStr || rowSession !== sessNum || rowDate !== String(date || '')) {
+          continue;
+        }
+        
+        matches++;
+        Logger.log(`LP_SUBMIT: Found matching row ${i+2}: class:${rowClass}, subject:${rowSubj}, session:${rowSession}, lpId:${rowLpId}`);
+        
+        // Set priority based on various factors (higher = better match to update)
+        let priority = 0;
+        
+        // If this is the exact lpId, highest priority (10)
+        if (lpId && String(lpId) === rowLpId) {
+          Logger.log(`LP_SUBMIT: → Found exact matching lpId (${rowLpId}) - priority 10`);
+          priority = 10;
+        }
+        // If status is "Pending Preparation", very high priority (8)
+        else if (rowStatus === 'Pending Preparation') {
+          Logger.log(`LP_SUBMIT: → Found 'Pending Preparation' row - priority 8`);
+          priority = 8;
+        }
+        // If empty objectives AND activities, high priority (6)
+        else if (!rowObjectives && !rowActivities) {
+          Logger.log(`LP_SUBMIT: → Found row with empty content - priority 6`);
+          priority = 6;
+        }
+        // If chapter matches and empty objectives OR activities, medium priority (4)
+        else if (chapterFromScheme && rowChapter === chapterFromScheme && (!rowObjectives || !rowActivities)) {
+          Logger.log(`LP_SUBMIT: → Found row with matching chapter and partial empty content - priority 4`);
+          priority = 4;
+        }
+        // If chapter matches, low priority (2)
+        else if (chapterFromScheme && rowChapter === chapterFromScheme) {
+          Logger.log(`LP_SUBMIT: → Found row with matching chapter - priority 2`);
+          priority = 2;
+        }
+        // Any other matching row, lowest priority (1)
+        else {
+          Logger.log(`LP_SUBMIT: → Found basic matching row - priority 1`);
+          priority = 1;
+        }
+        
+        // Update our best match if this one has higher priority
+        if (priority > bestPriority) {
+          bestPriority = priority;
+          bestRowIndex = i;
+          placeholderLpId = rowLpId;
+          Logger.log(`LP_SUBMIT: → New best match: row ${i+2}, lpId ${rowLpId}, priority ${priority}`);
           
-          Logger.log(`LP_SUBMIT: Found matching placeholder at row ${i+2}`);
+          // If priority is 8 or higher (exact match or Pending Preparation), stop looking
+          if (priority >= 8) break;
+        }
+      }
+      
+      // If we found a good match, set the placeholderLpId
+      if (bestRowIndex >= 0) {
+        placeholderLpId = String(values[bestRowIndex][idIdx] || '');
+        Logger.log(`LP_SUBMIT: Selected best row to update: ${bestRowIndex+2}, lpId ${placeholderLpId}, priority ${bestPriority}`);
+      }
+      
+      // Only check for strict duplicates if we haven't found a placeholder to update
+      if (!placeholderLpId) {
+        for (let i=0;i<values.length;i++) {
+          const rowClass = String(values[i][classIdx] || '').trim();
+          const rowSubj = String(values[i][subjIdx] || '').trim();
+          const rowSession = Number(values[i][sessionIdx] || 0);
+          const rowChapter = String(values[i][chapterIdx] || '').trim();
+          const rowDate = String(values[i][dateIdx] || '').trim();
+          const rowLpId = String(values[i][idIdx] || '');
+          const rowStatus = String(values[i][statusIdx] || '').trim();
+          
+          // Only check non-placeholders for duplicates (ones with content)
+      if (rowClass === clsStr && rowSubj === subjStr && rowSession === sessNum && rowDate === String(date || '') && 
+              rowStatus !== 'Pending Preparation') {
+            
+            // If chapter is known (from scheme or row) and matches, treat as duplicate
+            if (chapterFromScheme && rowChapter && rowChapter === chapterFromScheme) {
+              Logger.log(`LP_SUBMIT: → Duplicate detected - matching chapter: ${chapterFromScheme}`);
+              return _respond({ error: 'Duplicate lesson plan exists for this class/subject/session/chapter' });
+            }
+            // If both have empty chapters and same class/subject/session, treat as duplicate
+            if (!chapterFromScheme && !rowChapter) {
+              Logger.log(`LP_SUBMIT: → Duplicate detected - both have empty chapters`);
+              return _respond({ error: 'Duplicate lesson plan exists for this class/subject/session' });
+            }
+          }
+        }
+      }
+      
+      Logger.log(`LP_SUBMIT: Found ${matches} matching rows, placeholderLpId: ${placeholderLpId || 'none'}`); 
+      
+      Logger.log(`LP_SUBMIT: Found ${matches} matching rows, placeholderLpId: ${placeholderLpId || 'none'}`);
+
+      // Try to find the row by lpId (from payload) or a discovered placeholderLpId and update if found
+      Logger.log(`LP_SUBMIT: Searching for row to update, target lpId: ${lpId || 'none'}, placeholderLpId: ${placeholderLpId || 'none'}`);
+      for (let i=0;i<values.length;i++) {
+        const rowLpId = String(values[i][idIdx] || '');
+        if ((lpId && rowLpId === String(lpId)) || (placeholderLpId && rowLpId === String(placeholderLpId))) {
+          Logger.log(`LP_SUBMIT: Updating existing row at index ${i+2} with lpId ${rowLpId}`);
+          Logger.log(`LP_SUBMIT: Row details - class:${values[i][classIdx]}, subject:${values[i][subjIdx]}, session:${values[i][sessionIdx]}`);
+          Logger.log(`LP_SUBMIT: Row status: ${values[i][statusIdx]}, chapter: ${values[i][chapterIdx] || '(none)'}`);
+          Logger.log(`LP_SUBMIT: Objectives empty: ${!values[i][objIdx]}, activities empty: ${!values[i][actIdx]}`);
+          
           values[i][objIdx] = objectives || '';
           values[i][actIdx] = activities || '';
           values[i][dateIdx] = date || '';
           values[i][statusIdx] = 'Pending Review';
-          // IMPORTANT FIX: Always ensure session is preserved
-          values[i][sessionIdx] = sessNum;
+          // optionally update chapter/class/subject/session if provided
+          if (clsStr) values[i][classIdx] = clsStr;
+          if (subjStr) values[i][subjIdx] = subjStr;
+          if (sessNum) values[i][sessionIdx] = sessNum;
+          if (date) values[i][dateIdx] = date;
           if (chapterFromScheme) values[i][chapterIdx] = chapterFromScheme;
-          
           sh.getRange(2+i,1,1,headers.length).setValues([values[i]]);
-          Logger.log(`LP_SUBMIT: Successfully updated placeholder row at ${i+2} with session ${sessNum}`);
+          Logger.log(`LP_SUBMIT: Successfully updated row. New status: ${values[i][statusIdx]}`);
           return _respond({ submitted: true });
         }
       }
 
-      // Check for duplicates with exact class/subject/session/chapter
-      for (let i=0; i<values.length; i++) {
-        const rowClass = String(values[i][classIdx] || '').trim();
-        const rowSubj = String(values[i][subjIdx] || '').trim();
-        const rowSession = Number(values[i][sessionIdx] || 0);
-        const rowChapter = String(values[i][chapterIdx] || '').trim();
-        
-        // Only consider non-placeholder rows with actual content
-        if (rowClass === clsStr && 
-            rowSubj === subjStr && 
-            rowSession === sessNum &&
-            rowChapter === chapterFromScheme &&
-            String(values[i][statusIdx] || '') !== 'Pending Preparation') {
-          
-          Logger.log(`LP_SUBMIT: Found duplicate at row ${i+2} - class:${rowClass}, subject:${rowSubj}, session:${rowSession}, chapter:${rowChapter}`);
-          return _respond({ error: 'Duplicate lesson plan exists for this class/subject/session/chapter' });
-        }
-      }
-
-      // Create a new lesson plan row
-      Logger.log(`LP_SUBMIT: No matching row found, creating new lesson plan with session ${sessNum}`);
+      // If lpId not found, append a new lesson plan row (only if no duplicate detected above)
+      Logger.log(`LP_SUBMIT: No matching row found to update, creating new row`);
+      Logger.log(`LP_SUBMIT: Searched through ${values.length} rows but couldn't find a suitable row to update`);
+      Logger.log(`LP_SUBMIT: Creating new row with class:${clsStr}, subject:${subjStr}, session:${sessNum}, chapter:${chapterFromScheme || '(none)'}`);
+      
       const now = new Date().toISOString();
       const newLpId = lpId && String(lpId).trim() ? String(lpId).trim() : _uuid();
       const newRow = [];
@@ -2482,17 +2555,15 @@ function doPost(e) {
       newRow[3] = clsStr; // class
       newRow[4] = subjStr; // subject
       newRow[5] = chapterFromScheme || ''; // chapter
-      newRow[6] = sessNum; // IMPORTANT FIX: Explicitly assign the session number
+      newRow[6] = sessNum; // session
       newRow[7] = objectives || '';
       newRow[8] = activities || '';
       newRow[9] = 'Pending Review'; // status
       newRow[10] = ''; // reviewerRemarks
       newRow[11] = date || '';
       newRow[12] = now;
-      
-      Logger.log(`LP_SUBMIT: Creating new row with session ${sessNum}`);
       sh.appendRow(newRow);
-      Logger.log(`LP_SUBMIT: Successfully created new row with lpId ${newLpId} and session ${sessNum}`);
+      Logger.log(`LP_SUBMIT: Successfully created new row with lpId ${newLpId}`);
       return _respond({ submitted: true });
     }
 
@@ -2566,32 +2637,11 @@ function doPost(e) {
 
     if (action === 'createExam') {
       // Create a new exam.  The payload should include email, creatorName,
-      // class, subject, examType, hasInternalMarks, internalMax, externalMax, totalMax and date.
+      // class, subject, examType, internalMax, externalMax, totalMax and date.
       const sh = _getSheet('Exams');
       _ensureHeaders(sh, SHEETS.Exams);
       const now = new Date().toISOString();
       const examId = _uuid();
-      // Normalize date to ISO format (YYYY-MM-DD)
-      let examDate = '';
-      if (data.date) {
-        // If already in ISO format, use as is
-        if (/^\d{4}-\d{2}-\d{2}/.test(data.date)) {
-          examDate = data.date;
-        } else {
-          // Try to parse and convert to ISO
-          const parsed = new Date(data.date);
-          if (!isNaN(parsed.getTime())) {
-            examDate = parsed.toISOString().slice(0, 10);
-          } else {
-            examDate = '';
-          }
-        }
-      }
-      
-      // Create descriptive exam name in the format: "ExamType - Class - Subject"
-      // This makes exams easier to identify in lists and reports
-      const examName = `${data.examType || 'Exam'} - ${data.class || ''} - ${data.subject || ''}`;
-      
       sh.appendRow([
         examId,
         (data.email||'').toLowerCase().trim(),
@@ -2599,13 +2649,11 @@ function doPost(e) {
         data.class || '',
         data.subject || '',
         data.examType || '',
-        Boolean(data.hasInternalMarks !== false), // Default to true for backwards compatibility
         Number(data.internalMax||0),
         Number(data.externalMax||0),
         Number(data.totalMax||0),
-        examDate,
-        now,
-        examName // Add the descriptive exam name
+        data.date || '',
+        now
       ]);
       // Populate ExamMarks with a placeholder row for each student in the class.
       try {
@@ -2643,265 +2691,7 @@ function doPost(e) {
         // Note: Apps Script logging is available via console.log or Logger.
         try { console && console.error && console.error('Failed to populate ExamMarks:', err); } catch (e) {}
       }
-  return _respond({ submitted: true, examId });
-    }
-    
-    if (action === 'createBulkExams') {
-      // Create multiple exams at once for different subjects with the same grading settings
-      // Payload should include: email, creatorName, class, examType, hasInternalMarks,
-      // internalMax, externalMax, and an array of subjects with their exam dates
-      try {
-        const { 
-          email, 
-          creatorName, 
-          class: cls, 
-          examType, 
-          hasInternalMarks, 
-          internalMax, 
-          externalMax, 
-          totalMax,
-          subjectExams // Array of {subject, date} objects
-        } = data;
-        
-        if (!email || !cls || !examType || !Array.isArray(subjectExams) || subjectExams.length === 0) {
-          return _respond({ error: 'Missing required fields for bulk exam creation' });
-        }
-        
-        const sh = _getSheet('Exams');
-        _ensureHeaders(sh, SHEETS.Exams);
-        const now = new Date().toISOString();
-        
-        // Get students for this class (we'll need them for each exam's mark placeholders)
-        const studentsSh = _getSheet('Students');
-        const sHeaders = _headers(studentsSh);
-        const students = _rows(studentsSh)
-          .map(r => _indexByHeader(r, sHeaders))
-          .filter(s => String(s.class || '') === String(cls));
-        
-        // Create an exam for each subject
-        const examIds = [];
-        const emSh = _getSheet('ExamMarks');
-        _ensureHeaders(emSh, SHEETS.ExamMarks);
-        
-        for (const subjectExam of subjectExams) {
-          const { subject, date } = subjectExam;
-          if (!subject) continue;
-          
-          const examId = _uuid();
-          examIds.push(examId);
-          
-          // Normalize date to ISO format (YYYY-MM-DD)
-          let examDate = '';
-          if (date) {
-            // If already in YYYY-MM-DD format, use as-is
-            if (/^\d{4}-\d{2}-\d{2}/.test(date)) {
-              examDate = date;
-            } else {
-              // Special handling for common problematic dates
-              if (date.includes('31 Dec 99') || date === '31 Dec 1999' || date === '12/31/99' || date === '12/31/1999') {
-                // Replace with today's date
-                examDate = new Date().toISOString().slice(0, 10);
-              } else if (date.includes('1 Jan 1950') || date === '01 Jan 1950' || date === '1/1/1950' || date === '01/01/1950') {
-                // Replace with today's date
-                examDate = new Date().toISOString().slice(0, 10);
-              } else {
-                // Try to parse the date
-                const parsed = new Date(date);
-                if (!isNaN(parsed.getTime())) {
-                  // If date is very old (before 2000), it's likely a placeholder or incorrect date
-                  // Replace with current date
-                  if (parsed.getFullYear() < 2000) {
-                    examDate = new Date().toISOString().slice(0, 10);
-                  } else {
-                    examDate = parsed.toISOString().slice(0, 10);
-                  }
-                } else {
-                  // If parsing fails, use today's date
-                  examDate = new Date().toISOString().slice(0, 10);
-                }
-              }
-            }
-          } else {
-            // If no date provided, use today's date
-            examDate = new Date().toISOString().slice(0, 10);
-          }
-          
-          // Create descriptive exam name
-          const examName = `${examType || 'Exam'} - ${cls || ''} - ${subject || ''}`;
-          
-          // Add the exam to the Exams sheet
-          sh.appendRow([
-            examId,
-            (email || '').toLowerCase().trim(),
-            creatorName || '',
-            cls || '',
-            subject || '',
-            examType || '',
-            Boolean(hasInternalMarks !== false),
-            Number(internalMax || 0),
-            Number(externalMax || 0),
-            Number(totalMax || 0),
-            examDate,
-            now,
-            examName
-          ]);
-          
-          // Create placeholder mark rows for this exam
-          const createdAt = new Date().toISOString();
-          try {
-            students.forEach(s => {
-              emSh.appendRow([
-                examId,
-                cls,
-                subject,
-                '', // teacherEmail
-                '', // teacherName
-                s.admNo || '',
-                s.name || '',
-                '', // internal
-                '', // external
-                '', // total
-                createdAt
-              ]);
-            });
-          } catch (err) {
-            console.error(`Failed to create placeholders for ${subject} exam:`, err);
-            // Non-fatal error, continue with other subjects
-          }
-        }
-        
-        return _respond({ 
-          submitted: true, 
-          examIds,
-          count: examIds.length
-        });
-      } catch (err) {
-        console.error('Error in bulk exam creation:', err);
-        return _respond({ error: `Failed to create bulk exams: ${err.message || String(err)}` });
-      }
-    }
-
-    if (action === 'updateExam') {
-      // Update an existing exam. Payload should contain examId and updated fields.
-      // Only headmasters should be allowed to update exams.
-      try {
-        const { examId, userEmail, class: cls, subject, examType, hasInternalMarks, internalMax, externalMax, totalMax, date } = data;
-        
-        if (!examId) {
-          return _respond({ error: 'Missing examId' });
-        }
-        
-        const sh = _getSheet('Exams');
-        const headers = _headers(sh);
-        const examIdIdx = headers.indexOf('examId');
-        const classIdx = headers.indexOf('class');
-        const subjectIdx = headers.indexOf('subject');
-        const examTypeIdx = headers.indexOf('examType');
-        const hasInternalMarksIdx = headers.indexOf('hasInternalMarks');
-        const internalMaxIdx = headers.indexOf('internalMax');
-        const externalMaxIdx = headers.indexOf('externalMax');
-        const totalMaxIdx = headers.indexOf('totalMax');
-        const dateIdx = headers.indexOf('date');
-        const examNameIdx = headers.indexOf('examName');
-        
-        const last = sh.getLastRow();
-        if (last < 2) {
-          return _respond({ error: 'No exams found' });
-        }
-        
-        const values = sh.getRange(2, 1, last - 1, headers.length).getValues();
-        
-        // Normalize date to ISO format (YYYY-MM-DD)
-        let examDate = '';
-        if (date) {
-          // If already in ISO format, use as is
-          if (/^\d{4}-\d{2}-\d{2}/.test(date)) {
-            examDate = date;
-          } else {
-            // Try to parse and convert to ISO
-            const parsed = new Date(date);
-            if (!isNaN(parsed.getTime())) {
-              examDate = parsed.toISOString().slice(0, 10);
-            } else {
-              examDate = date; // Keep original value if parsing fails
-            }
-          }
-        }
-        
-        // Find the exam row to update
-        for (let i = 0; i < values.length; i++) {
-          if (String(values[i][examIdIdx]) === String(examId)) {
-            // Update the exam properties
-            if (cls) values[i][classIdx] = cls;
-            if (subject) values[i][subjectIdx] = subject;
-            if (examType) values[i][examTypeIdx] = examType;
-            if (hasInternalMarks !== undefined) values[i][hasInternalMarksIdx] = Boolean(hasInternalMarks);
-            if (internalMax !== undefined) values[i][internalMaxIdx] = Number(internalMax);
-            if (externalMax !== undefined) values[i][externalMaxIdx] = Number(externalMax);
-            if (totalMax !== undefined) values[i][totalMaxIdx] = Number(totalMax);
-            if (examDate) values[i][dateIdx] = examDate;
-            
-            // Update exam name to follow the format: "ExamType - Class - Subject"
-            const newExamType = examType || String(values[i][examTypeIdx]) || 'Exam';
-            const newClass = cls || String(values[i][classIdx]) || '';
-            const newSubject = subject || String(values[i][subjectIdx]) || '';
-            const newExamName = `${newExamType} - ${newClass} - ${newSubject}`;
-            
-            if (examNameIdx !== -1) {
-              values[i][examNameIdx] = newExamName;
-            }
-            
-            // Update the row in the sheet
-            sh.getRange(2 + i, 1, 1, headers.length).setValues([values[i]]);
-            
-            // Also update class and subject in ExamMarks if they've changed
-            if (cls || subject) {
-              const originalClass = String(values[i][classIdx]);
-              const originalSubject = String(values[i][subjectIdx]);
-              
-              if (cls !== originalClass || subject !== originalSubject) {
-                try {
-                  const emSh = _getSheet('ExamMarks');
-                  const emHeaders = _headers(emSh);
-                  const emExamIdIdx = emHeaders.indexOf('examId');
-                  const emClassIdx = emHeaders.indexOf('class');
-                  const emSubjectIdx = emHeaders.indexOf('subject');
-                  
-                  const emLast = emSh.getLastRow();
-                  if (emLast >= 2) {
-                    const emValues = emSh.getRange(2, 1, emLast - 1, emHeaders.length).getValues();
-                    let hasUpdates = false;
-                    
-                    for (let j = 0; j < emValues.length; j++) {
-                      if (String(emValues[j][emExamIdIdx]) === String(examId)) {
-                        // Update class and subject if they've changed
-                        if (cls && cls !== originalClass) emValues[j][emClassIdx] = cls;
-                        if (subject && subject !== originalSubject) emValues[j][emSubjectIdx] = subject;
-                        hasUpdates = true;
-                      }
-                    }
-                    
-                    // Write back updates if any were made
-                    if (hasUpdates) {
-                      emSh.getRange(2, 1, emValues.length, emHeaders.length).setValues(emValues);
-                    }
-                  }
-                } catch (err) {
-                  console.error('Failed to update ExamMarks:', err);
-                  // Non-fatal error, continue with success response
-                }
-              }
-            }
-            
-            return _respond({ updated: true });
-          }
-        }
-        
-        return _respond({ error: 'Exam not found' });
-      } catch (err) {
-        console.error('Error updating exam:', err);
-        return _respond({ error: 'Failed to update exam: ' + (err.message || String(err)) });
-      }
+  return _respond({ submitted: true });
     }
 
     if (action === 'getAllExams') {
@@ -2912,44 +2702,20 @@ function doPost(e) {
         const exams = _rows(sh).map(r => _indexByHeader(r, headers));
         
         // Format exam data for frontend
-        const formattedExams = exams.map(exam => {
-          // Normalize date to ISO format (YYYY-MM-DD)
-          let examDate = '';
-          if (exam.date) {
-            // If already in ISO format, use as is
-            if (/^\d{4}-\d{2}-\d{2}/.test(exam.date)) {
-              examDate = exam.date;
-            } else {
-              // Try to parse and convert to ISO
-              try {
-                const parsed = new Date(exam.date);
-                if (!isNaN(parsed.getTime())) {
-                  examDate = parsed.toISOString().slice(0, 10);
-                } else {
-                  examDate = exam.date; // Keep as is if can't parse
-                }
-              } catch (e) {
-                examDate = exam.date; // Keep as is if any error
-              }
-            }
-          }
-          
-          return {
-            examId: exam.examId,
-            examName: exam.examName || `${exam.examType || 'Exam'} - ${exam.class || ''} - ${exam.subject || ''}`,
-            class: exam.class,
-            subject: exam.subject,
-            examType: exam.examType,
-            date: examDate, // Use normalized date
-            creatorEmail: exam.creatorEmail,
-            creatorName: exam.creatorName,
-            hasInternalMarks: exam.hasInternalMarks,
-            internalMax: exam.internalMax,
-            externalMax: exam.externalMax,
-            totalMax: exam.totalMax,
-            createdAt: exam.createdAt
-          };
-        });
+        const formattedExams = exams.map(exam => ({
+          examId: exam.examId,
+          examName: `${exam.examType || 'Exam'} - ${exam.subject}`,
+          class: exam.class,
+          subject: exam.subject,
+          examType: exam.examType,
+          examDate: exam.date,
+          creatorEmail: exam.creatorEmail,
+          creatorName: exam.creatorName,
+          internalMax: exam.internalMax,
+          externalMax: exam.externalMax,
+          totalMax: exam.totalMax,
+          createdAt: exam.createdAt
+        }));
         
         // Sort by creation date (newest first)
         formattedExams.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
@@ -2972,14 +2738,6 @@ function doPost(e) {
       const teacherName = data.teacherName || '';
       const marks = Array.isArray(data.marks) ? data.marks : [];
       if (!examId) return _respond({ error: 'Missing examId' });
-      
-      // Get exam data to check if it has internal marks
-      const examsSh = _getSheet('Exams');
-      const examHeaders = _headers(examsSh);
-      const examRows = _rows(examsSh).map(r => _indexByHeader(r, examHeaders));
-      const exam = examRows.find(e => e.examId === examId);
-      const hasInternalMarks = exam ? (exam.hasInternalMarks !== false) : true; // Default to true for backwards compatibility
-      
       const sh = _getSheet('ExamMarks');
       _ensureHeaders(sh, SHEETS.ExamMarks);
       const now = new Date().toISOString();
@@ -3005,7 +2763,7 @@ function doPost(e) {
       marks.forEach(m => {
         const adm = String(m.admNo || '');
         const name = String(m.studentName || '');
-        const internal = hasInternalMarks ? Number(m.internal || 0) : 0; // Set to 0 if exam has no internal marks
+        const internal = Number(m.internal || 0);
         const external = Number(m.external || 0);
         const total = internal + external;
 
@@ -3431,10 +3189,6 @@ function doPost(e) {
       }
     }
 
-    if (action === 'debugExamMarks') {
-      return _respond(debugExamMarks());
-    }
-
     return _respond({ error: 'Unknown action' });
   } catch (err) {
     return _respond({ error: String(err && err.message ? err.message : err) });
@@ -3821,46 +3575,6 @@ function testSpreadsheetData() {
 }
 
 /**
- * Debug function to check exam marks data
- */
-function debugExamMarks() {
-  try {
-    const marksSh = _getSheet('ExamMarks');
-    const marksHeaders = _headers(marksSh);
-    const marksData = _rows(marksSh).map(r => _indexByHeader(r, marksHeaders));
-    
-    console.log('ExamMarks Headers:', marksHeaders);
-    console.log('ExamMarks Data Count:', marksData.length);
-    console.log('Sample ExamMarks Data:', marksData.slice(0, 3));
-    
-    // Also check Exams data
-    const examsSh = _getSheet('Exams');
-    const examsHeaders = _headers(examsSh);
-    const examsData = _rows(examsSh).map(r => _indexByHeader(r, examsHeaders));
-    
-    console.log('Exams Headers:', examsHeaders);
-    console.log('Exams Data Count:', examsData.length);
-    console.log('Sample Exams Data:', examsData.slice(0, 3));
-    
-    return {
-      examMarks: {
-        headers: marksHeaders,
-        count: marksData.length,
-        sample: marksData.slice(0, 3)
-      },
-      exams: {
-        headers: examsHeaders,
-        count: examsData.length,
-        sample: examsData.slice(0, 3)
-      }
-    };
-  } catch (error) {
-    console.error('Debug exam marks error:', error);
-    return { error: error.message };
-  }
-}
-
-/**
  * Test function to debug day name recognition
  */
 function testDayNameRecognition() {
@@ -3886,3 +3600,5 @@ function testDayNameRecognition() {
     timezone: Session.getScriptTimeZone()
   };
 }
+
+// Removed duplicate _parsePost and doPost to prevent overriding the main POST handler above.

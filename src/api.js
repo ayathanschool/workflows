@@ -4,6 +4,11 @@
 const PROD_BASE = import.meta.env.VITE_GAS_WEB_APP_URL || '';
 const BASE_URL = import.meta.env.DEV ? '/gas' : PROD_BASE;
 
+// Export BASE_URL for components that need to build direct URLs
+export function getBaseUrl() {
+  return BASE_URL;
+}
+
 // Lightweight logger: disabled in production build to avoid noise
 const __DEV_LOG__ = !!import.meta.env.DEV && (import.meta.env.VITE_VERBOSE_API === 'true');
 const devLog = (...args) => { if (__DEV_LOG__) console.log('[api]', ...args); };
@@ -32,7 +37,7 @@ function setCacheEntry(key, data, duration = CACHE_DURATION) {
   });
 }
 
-async function getJSON(url) {
+async function getJSON(url, cacheDuration = CACHE_DURATION) {
   const cacheKey = getCacheKey(url);
   
   // Check cache first
@@ -65,9 +70,8 @@ async function getJSON(url) {
     
     const result = await requestPromise;
     
-    // Cache the result
-    const duration = url.includes('getHmInsights') || url.includes('getAllClasses') ? CACHE_DURATION : SHORT_CACHE_DURATION;
-    setCacheEntry(cacheKey, result, duration);
+    // Cache the result with specified duration
+    setCacheEntry(cacheKey, result, cacheDuration);
     
     // Clear pending request
     pendingRequests.delete(cacheKey);
@@ -200,7 +204,10 @@ export async function getTeacherWeeklyTimetable(email) {
 }
 
 export async function getTeacherDailyTimetable(email, date) {
-  return getJSON(`${BASE_URL}?action=getTeacherDailyTimetable&email=${encodeURIComponent(email)}&date=${encodeURIComponent(date)}`)
+  console.log('📞 API call: getTeacherDailyTimetable', { email, date });
+  const result = await getJSON(`${BASE_URL}?action=getTeacherDailyTimetable&email=${encodeURIComponent(email)}&date=${encodeURIComponent(date)}`, SHORT_CACHE_DURATION);
+  console.log('📞 API response: getTeacherDailyTimetable', result);
+  return result;
 }
 
 export async function getTeacherLessonPlanFilters(email) {
@@ -252,9 +259,15 @@ export async function updateLessonPlanDetailsStatus(lpId, status, remarks='') {
   return postJSON(`${BASE_URL}?action=updateLessonPlanDetailsStatus`, { lpId, status, remarks })
 }
 
+// Get approved lesson plans for report
 export async function getApprovedLessonPlansForReport(email, cls, subject) {
-  const q = new URLSearchParams({ action: 'getApprovedLessonPlansForReport', email, class: cls, subject })
-  return getJSON(`${BASE_URL}?${q.toString()}`)
+  const q = new URLSearchParams({ action: "getApprovedLessonPlansForReport", email, class: cls, subject });
+  return getJSON(`${BASE_URL}?${q.toString()}`);
+}
+
+// Debug function to check exam marks data
+export async function debugExamMarks() {
+  return getJSON(`${BASE_URL}?action=debugExamMarks`);
 }
 
 export async function submitDailyReport(data) {
@@ -263,7 +276,7 @@ export async function submitDailyReport(data) {
 
 export async function getTeacherDailyReportsForDate(email, date) {
   const q = new URLSearchParams({ action: 'getTeacherDailyReportsForDate', email, date })
-  return getJSON(`${BASE_URL}?${q.toString()}`)
+  return getJSON(`${BASE_URL}?${q.toString()}`, SHORT_CACHE_DURATION)
 }
 
 export async function getAllClasses() {
@@ -326,6 +339,86 @@ export async function getAssignedSubstitutions(date, options={}) {
   return getJSON(`${BASE_URL}?${q.toString()}`)
 }
 
+// Debug endpoint to check raw substitutions data
+export async function debugSubstitutions(date, options={}) {
+  const { noCache = false } = options || {};
+  const q = new URLSearchParams({ action: 'debugSubstitutions', date })
+  if (noCache) q.append('_', String(Date.now()))
+  return getJSON(`${BASE_URL}?${q.toString()}`)
+}
+
+// New substitution management functions
+export async function getDailyTimetableForDate(date, options={}) {
+  const { noCache = false } = options || {};
+  const q = new URLSearchParams({ action: 'getDailyTimetableForDate', date })
+  if (noCache) q.append('_', String(Date.now()))
+  return getJSON(`${BASE_URL}?${q.toString()}`)
+}
+
+export async function getSubstitutionsForDate(date, options={}) {
+  const { noCache = false } = options || {};
+  
+  // Clear cache for this specific endpoint
+  if (noCache) {
+    for (const [key] of apiCache) {
+      if (key.includes('getSubstitutionsForDate')) {
+        apiCache.delete(key);
+      }
+    }
+  }
+  
+  // Enforce date format consistency
+  const normalizedDate = typeof date === 'string' ? date.trim() : String(date || '');
+  
+  const q = new URLSearchParams({ 
+    action: 'getSubstitutionsForDate', 
+    date: normalizedDate 
+  });
+  
+  // Force cache bypass
+  q.append('_', String(Date.now()));
+  
+  console.log(`[API] Fetching substitutions for date: ${normalizedDate}`);
+  
+  try {
+    const result = await getJSON(`${BASE_URL}?${q.toString()}`);
+    
+    // Handle different response formats
+    if (Array.isArray(result)) {
+      console.log(`[API] Got ${result.length} substitutions directly`);
+      return result;
+    } else if (result && result.data && Array.isArray(result.data)) {
+      console.log(`[API] Got ${result.data.length} substitutions from result.data`);
+      return result.data;
+    } else if (result && result.substitutions && Array.isArray(result.substitutions)) {
+      console.log(`[API] Got ${result.substitutions.length} substitutions from result.substitutions`);
+      return result.substitutions;
+    } else {
+      console.warn(`[API] Unexpected substitution data format:`, result);
+      return Array.isArray(result) ? result : [];
+    }
+  } catch (err) {
+    console.error(`[API] Error fetching substitutions:`, err);
+    // Rethrow with helpful context
+    throw new Error(`Failed to fetch substitutions for ${normalizedDate}: ${err.message || String(err)}`);
+  }
+}
+
+export async function getAvailableTeachers(date, period, options={}) {
+  const { noCache = false } = options || {};
+  const q = new URLSearchParams({ action: 'getAvailableTeachers', date, period })
+  if (noCache) q.append('_', String(Date.now()))
+  return getJSON(`${BASE_URL}?${q.toString()}`)
+}
+
+export async function addSubstitution(data) {
+  return postJSON(`${BASE_URL}?action=addSubstitution`, data)
+}
+
+export async function deleteSubstitution(substitutionId) {
+  return postJSON(`${BASE_URL}?action=deleteSubstitution`, { substitutionId })
+}
+
 // HM Insights & Analytics (basic)
 export async function getHmInsights() {
   return getJSON(`${BASE_URL}?action=getHmInsights`)
@@ -356,8 +449,28 @@ export async function getAppSettings() {
 
 // Retrieve a list of exams.  Optional filters (class, subject, examType) can
 // be provided to limit the results.  Returns an array of exam objects.
-export async function getExams(cls = '', subject = '', examType = '') {
-  const q = new URLSearchParams({ action: 'getExams', class: cls, subject, examType })
+export async function getExams(options = {}) {
+  // Handle both object parameter and legacy positional parameters
+  let cls = '', subject = '', examType = '', teacherEmail = '', role = '', _ts;
+  
+  if (typeof options === 'object') {
+    ({ class: cls = '', subject = '', examType = '', teacherEmail = '', role = '', _ts } = options);
+  } else {
+    // Legacy support for positional parameters
+    cls = options || '';
+    // Additional parameters are ignored in legacy mode
+  }
+  
+  const q = new URLSearchParams({ 
+    action: 'getExams', 
+    class: cls, 
+    subject,
+    examType,
+    ...(teacherEmail ? { teacherEmail } : {}),
+    ...(role ? { role } : {}),
+    ...(_ts ? { _ts } : {})
+  });
+  
   return getJSON(`${BASE_URL}?${q.toString()}`)
 }
 
@@ -366,6 +479,19 @@ export async function getExams(cls = '', subject = '', examType = '') {
 // totalMax and date.  Returns { ok: true, examId } on success.
 export async function createExam(email, examData) {
   return postJSON(`${BASE_URL}?action=createExam`, { email, ...examData })
+}
+
+// Create multiple exams at once for different subjects with the same grading settings.
+// Payload should include class, examType, hasInternalMarks, internalMax, externalMax, 
+// and an array of subject+date pairs.
+export async function createBulkExams(email, bulkExamData) {
+  return postJSON(`${BASE_URL}?action=createBulkExams`, { email, ...bulkExamData })
+}
+
+// Update an existing exam. Requires examId and updated exam details.
+// Returns { ok: true } on success.
+export async function updateExam(examData) {
+  return postJSON(`${BASE_URL}?action=updateExam`, examData)
 }
 
 // Submit exam marks.  The payload must include examId, class, subject,
@@ -379,6 +505,47 @@ export async function submitExamMarks(data) {
 export async function getExamMarks(examId) {
   const q = new URLSearchParams({ action: 'getExamMarks', examId })
   return getJSON(`${BASE_URL}?${q.toString()}`)
+}
+
+// Get all exams - using working getExams function directly
+export async function getAllExams() {
+  try {
+    console.log('Getting all exams using getExams...');
+    // Use the existing getExams function that works in ExamManagement
+    // Call getExams with empty parameters to get all exams (no filtering)
+    const examData = await getExams('', '', ''); // empty strings for class, subject, examType
+    console.log('getExams call successful:', examData);
+    
+    // Transform the data to match the expected format for getAllExams
+    const transformed = Array.isArray(examData) ? examData.map(exam => ({
+      examId: exam.examId,
+      examName: exam.examName || `${exam.examType || 'Exam'} - ${exam.class || ''} - ${exam.subject || ''}`,
+      class: exam.class,
+      subject: exam.subject,
+      examType: exam.examType,
+      examDate: exam.date,
+      creatorEmail: exam.creatorEmail,
+      creatorName: exam.creatorName,
+      internalMax: exam.internalMax,
+      externalMax: exam.externalMax,
+      totalMax: exam.totalMax,
+      createdAt: exam.date // Use date as fallback for createdAt
+    })) : [];
+    
+    console.log('Transformed exam data for getAllExams:', transformed);
+    return transformed;
+  } catch (error) {
+    console.error('getAllExams using getExams failed:', error);
+    throw error;
+  }
+}
+
+// Get student report card data
+export async function getStudentReportCard(examId, admNo = '', cls = '') {
+  const q = new URLSearchParams({ action: 'getStudentReportCard', examId });
+  if (admNo) q.append('admNo', admNo);
+  if (cls) q.append('class', cls);
+  return getJSON(`${BASE_URL}?${q.toString()}`);
 }
 
 // Administrative API
@@ -418,6 +585,12 @@ export async function getDailyReports({ teacher = '', cls = '', subject = '', da
 }
 
 // Students and Attendance
+
+// Get a centralized list of all subjects from all data sources
+export async function getSubjects() {
+  return getJSON(`${BASE_URL}?action=getSubjects`)
+    .then(result => result.subjects || [])
+}
 
 // Get a list of students.  If a class is supplied, return only students in
 // that class; otherwise return all students.
@@ -477,4 +650,57 @@ export async function saveCalendarEvent(eventData) {
 // Delete a personal calendar event
 export async function deleteCalendarEvent(eventId) {
   return postJSON(`${BASE_URL}?action=deleteCalendarEvent`, { eventId });
+}
+
+// Lesson Progress Tracking
+export async function getLessonProgressSummary(teacherEmail, cls = '', subject = '') {
+  const q = new URLSearchParams({ 
+    action: 'getLessonProgressSummary', 
+    teacherEmail, 
+    class: cls, 
+    subject 
+  });
+  return getJSON(`${BASE_URL}?${q.toString()}`);
+}
+
+export async function getTeacherLessonDelays(teacherEmail, cls = '', subject = '') {
+  const q = new URLSearchParams({ 
+    action: 'getTeacherLessonDelays', 
+    teacherEmail, 
+    class: cls, 
+    subject 
+  });
+  return getJSON(`${BASE_URL}?${q.toString()}`);
+}
+
+// HM-specific API functions for lesson progress with all teachers
+export async function getAllLessonProgressSummary(teacherEmail = '', cls = '', subject = '') {
+  const q = new URLSearchParams({ 
+    action: 'getAllLessonProgressSummary', 
+    teacherEmail, 
+    class: cls, 
+    subject 
+  });
+  return getJSON(`${BASE_URL}?${q.toString()}`);
+}
+
+export async function getAllTeacherLessonDelays(teacherEmail = '', cls = '', subject = '') {
+  const q = new URLSearchParams({ 
+    action: 'getAllTeacherLessonDelays', 
+    teacherEmail, 
+    class: cls, 
+    subject 
+  });
+  return getJSON(`${BASE_URL}?${q.toString()}`);
+}
+
+export async function getAllTeachers() {
+  // Note: This endpoint requires backend deployment
+  // Return empty array to gracefully handle missing functionality
+  try {
+    return await getJSON(`${BASE_URL}?action=getAllTeachers`);
+  } catch (error) {
+    console.warn('getAllTeachers endpoint not available - backend update required:', error);
+    return [];
+  }
 }

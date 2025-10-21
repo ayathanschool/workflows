@@ -7,12 +7,15 @@ import { useGoogleAuth } from './contexts/GoogleAuthContext';
 import ThemeToggle from './components/ThemeToggle';
 import AnimatedPage from './components/AnimatedPage';
 import { useTheme } from './contexts/ThemeContext';
-import SubstitutionModule from './components/SubstitutionModule';
+import EnhancedSubstitutionView from './components/EnhancedSubstitutionView';
 import DailyReportTimetable from './DailyReportTimetable';
+import ClassPeriodSubstitutionView from './components/ClassPeriodSubstitutionView';
 import AppLayout from './components/AppLayout';
 import CalendarPage from './pages/CalendarPage';
 import ExamManagement from './components/ExamManagement';
-import { periodToTimeString, isDateForNextWeek } from './utils/dateUtils';
+import ReportCard from './components/ReportCard';
+import LessonProgressTracker from './components/LessonProgressTracker';
+import { periodToTimeString, isDateForNextWeek, todayIST, formatDateForInput, parseApiDate, createISTTimestamp, formatIndianDate, toISTDateString } from './utils/dateUtils';
 import { 
   User, 
   BookOpen, 
@@ -29,6 +32,7 @@ import {
   Book,
   Clipboard,
   BarChart2,
+  TrendingUp,
   Bell,
   Search,
   Filter,
@@ -49,12 +53,33 @@ import {
   UserPlus,
   BookCheck,
   FileCheck,
-  FileClock
+  FileClock,
+  RefreshCw,
+  LayoutGrid
 } from 'lucide-react';
+
+// Common utility functions to avoid duplication
+const appNormalize = (s) => (s || '').toString().trim().toLowerCase();
 
 const App = () => {
   // API error banner state
   const [apiError, setApiError] = useState(null);
+  
+  // App settings for the whole application
+  const [appSettings, setAppSettings] = useState({
+    lessonPlanningDay: '',       // No restriction until settings define it
+    allowNextWeekOnly: false,    // Next-week-only restriction disabled
+    periodTimes: null            // Will store custom period times if available
+  });
+  
+  // Create a memoized version of appSettings to avoid unnecessary re-renders
+  const memoizedSettings = useMemo(() => {
+    return appSettings || {
+      lessonPlanningDay: '',
+      allowNextWeekOnly: false,
+      periodTimes: null
+    };
+  }, [appSettings]);
 
   useEffect(() => {
     const handler = (e) => {
@@ -62,6 +87,26 @@ const App = () => {
     };
     window.addEventListener('api-error', handler);
     return () => window.removeEventListener('api-error', handler);
+  }, []);
+  
+  // Fetch app settings from the API
+  useEffect(() => {
+    async function fetchAppSettings() {
+      try {
+        const settings = await api.getAppSettings();
+        if (settings) {
+          setAppSettings({
+            lessonPlanningDay: settings.lessonPlanningDay || '',
+            allowNextWeekOnly: false, // Ignore sheet value; do not restrict to next week
+            periodTimes: settings.periodTimes || null
+          });
+        }
+      } catch (err) {
+        console.warn('Error loading app settings:', err);
+        // Keep default settings
+      }
+    }
+    fetchAppSettings();
   }, []);
 
   // ----- GLOBAL submit overlay + toast -----
@@ -259,11 +304,21 @@ const App = () => {
         { id: 'lesson-plans', label: 'Lesson Plans', icon: BookOpen },
         { id: 'timetable', label: 'Timetable', icon: Calendar },
         { id: 'calendar', label: 'Calendar', icon: CalendarDays },
-        { id: 'reports', label: 'Daily Reports', icon: FileText }
+        { id: 'reports', label: 'Daily Reports', icon: FileText },
+        { id: 'lesson-progress', label: 'Lesson Progress', icon: TrendingUp }
       );
       // Teachers and class teachers can also manage exams: view available exams,
       // enter marks for their classes and subjects, and view marks.
       items.push({ id: 'exam-marks', label: 'Exam Marks', icon: Award });
+      items.push({ id: 'report-card', label: 'Report Card', icon: FileText });
+    }
+
+    // Daily reporting teachers should have access to daily reports functionality
+    if (hasAnyRole(['daily reporting teachers'])) {
+      items.push(
+        { id: 'timetable', label: 'Timetable', icon: Calendar },
+        { id: 'reports', label: 'Daily Reports', icon: FileText }
+      );
     }
 
   if (hasRole('class teacher')) {
@@ -275,20 +330,27 @@ const App = () => {
 
   if (hasRole('h m')) {
       items.push(
-        { id: 'hm-dashboard', label: 'HM Dashboard', icon: BarChart2 },
         { id: 'scheme-approvals', label: 'Scheme Approvals', icon: FileCheck },
         { id: 'lesson-approvals', label: 'Lesson Approvals', icon: BookCheck },
         { id: 'substitutions', label: 'Substitutions', icon: UserPlus },
+        { id: 'class-period-timetable', label: 'Class-Period View', icon: LayoutGrid },
         { id: 'full-timetable', label: 'Full Timetable', icon: CalendarDays },
         { id: 'calendar', label: 'School Calendar', icon: Calendar },
         { id: 'analytics', label: 'Analytics', icon: BarChart2 },
-        { id: 'exam-marks', label: 'Exam Marks', icon: Award }
+        { id: 'exam-marks', label: 'Exam Marks', icon: Award },
+        { id: 'report-card', label: 'Report Card', icon: FileText }
       );
       // Additional management views for the headmaster: view all plans and daily reports.
       items.push(
         { id: 'all-plans', label: 'All Plans', icon: Clipboard },
-        { id: 'daily-reports-management', label: 'All Reports', icon: FileText }
+        { id: 'daily-reports-management', label: 'All Reports', icon: FileText },
+        { id: 'lesson-progress', label: 'Lesson Progress', icon: TrendingUp }
       );
+    }
+
+    // Students can view their report cards
+    if (hasAnyRole(['student'])) {
+      items.push({ id: 'report-card', label: 'My Report Card', icon: FileText });
     }
 
     return items;
@@ -326,14 +388,14 @@ const App = () => {
               teacherCount: hmData?.teacherCount || 0,
               classCount: Array.isArray(classes) ? classes.length : 0
             }));
-          } else if (hasAnyRole(['teacher','class teacher'])) {
+          } else if (hasAnyRole(['teacher','class teacher','daily reporting teachers'])) {
             // Teacher view: compute classes and subjects from user object
             const classCount = Array.isArray(user.classes) ? user.classes.length : 0;
             const subjectCount = Array.isArray(user.subjects) ? user.subjects.length : 0;
             // Attempt to fetch daily reports for today to count pending submissions
             let pendingReports = 0;
             try {
-              const todayIso = new Date().toISOString().split('T')[0];
+              const todayIso = todayIST();
               const reports = await api.getTeacherDailyReportsForDate(user.email, todayIso);
               if (Array.isArray(reports)) {
                 // Count reports that are not yet submitted (status != 'Submitted')
@@ -419,7 +481,7 @@ const App = () => {
               </div>
             </div>
           </div>
-  ) : user && hasAnyRole(['teacher','class teacher']) ? (
+  ) : user && hasAnyRole(['teacher','class teacher','daily reporting teachers']) ? (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             {/* Classes Teaching */}
             <div className="bg-white rounded-xl shadow-sm p-6 border border-gray-100">
@@ -649,9 +711,10 @@ const App = () => {
       </div>
     );
   };
-
+  
   // Main content router
   const renderContent = () => {
+    
     return (
       <AnimatedPage transitionKey={activeView}>
         {(() => {
@@ -668,20 +731,27 @@ const App = () => {
         return <CalendarPage user={user} />;
       case 'reports':
         return <ReportsView />;
+      case 'lesson-progress':
+        return <LessonProgressTracker user={user} />;
       case 'hm-dashboard':
-        return <HMDashboardView />;
+        // hm-dashboard should reuse the main Dashboard to avoid duplicate UIs
+        return <Dashboard />;
+      case 'day-timetable':
+        return <DayTimetableView periodTimes={memoizedSettings.periodTimes} />;
       case 'scheme-approvals':
         return <SchemeApprovalsView />;
       case 'lesson-approvals':
         return <LessonApprovalsView />;
       case 'substitutions':
-        return <SubstitutionModule />;
+        return <EnhancedSubstitutionView user={user} periodTimes={memoizedSettings.periodTimes} />;
       case 'full-timetable':
         return <FullTimetableView />;
       case 'analytics':
         return <AnalyticsView />;
       case 'exam-marks':
-        return <ExamManagement user={user} />;
+        return <ExamManagement user={user} withSubmit={withSubmit} setToast={setToast} />;
+      case 'report-card':
+        return <ReportCard user={user} />;
       case 'class-data':
         return <ClassDataView />;
       case 'class-students':
@@ -690,6 +760,8 @@ const App = () => {
         return <AllPlansView />;
       case 'daily-reports-management':
         return <DailyReportsManagementView />;
+      case 'class-period-timetable':
+        return <ClassPeriodSubstitutionView user={user} periodTimes={memoizedSettings.periodTimes} />;
       default:
         return <Dashboard />;
     }
@@ -998,11 +1070,20 @@ const App = () => {
     };
 
     // App settings for lesson plan preparation
-    const [appSettings, setAppSettings] = useState({
+    const [lessonPlanSettings, setLessonPlanSettings] = useState({
       lessonPlanningDay: '',       // No restriction until settings define it
       allowNextWeekOnly: false,    // Next-week-only restriction disabled
       periodTimes: null            // Will store custom period times if available
     });
+    
+    // Create a memoized version of lessonPlanSettings to avoid unnecessary re-renders
+    const memoizedLessonPlanSettings = useMemo(() => {
+      return lessonPlanSettings || {
+        lessonPlanningDay: '',
+        allowNextWeekOnly: false,
+        periodTimes: null
+      };
+    }, [lessonPlanSettings]);
     // Track when settings have been loaded to avoid enforcing defaults prematurely
     const [settingsLoaded, setSettingsLoaded] = useState(false);
     // Track if the user is trying to plan outside allowed days
@@ -1059,22 +1140,13 @@ const App = () => {
           }
           
           // Fetch app settings LAST so it's freshest when we check rules below
-          try {
-            const settings = await api.getAppSettings();
-            if (settings) {
-              const normalizedDay = normalizeDayNameClient(settings.lessonPlanningDay || '');
-              setAppSettings({
-                lessonPlanningDay: normalizedDay,
-                allowNextWeekOnly: false, // Ignore sheet value; do not restrict to next week
-                periodTimes: settings.periodTimes || null
-              });
-              setSettingsLoaded(true);
-            }
-          } catch (err) {
-            console.warn('Error loading app settings:', err);
-            // Keep default settings
-            setSettingsLoaded(true); // Consider settings load attempt finished
-          }
+          // Use the app-level settings instead of fetching again
+          setLessonPlanSettings({
+            lessonPlanningDay: memoizedSettings.lessonPlanningDay || '',
+            allowNextWeekOnly: false, // Ignore sheet value; do not restrict to next week
+            periodTimes: memoizedSettings.periodTimes || null
+          });
+          setSettingsLoaded(true);
         } catch (err) {
           console.error(err);
         }
@@ -1086,7 +1158,7 @@ const App = () => {
       // First check if planning is allowed based on settings
   const today = new Date();
   const todayName = today.toLocaleDateString('en-US', { weekday: 'long' });
-      const normalizedSettingDay = normalizeDayNameClient(appSettings.lessonPlanningDay || '');
+      const normalizedSettingDay = normalizeDayNameClient(memoizedLessonPlanSettings.lessonPlanningDay || '');
       const isAllowedPlanningDay = normalizedSettingDay
         ? normalizeDayNameClient(todayName) === normalizedSettingDay
         : true; // No restriction if no planning day configured
@@ -1281,7 +1353,7 @@ const App = () => {
                   class: dup.class,
                   subject: dup.subject,
                   period: dup.session,
-                  date: new Date().toISOString().split('T')[0],
+                  date: todayIST(),
                   day: new Date().toLocaleDateString('en-US', { weekday: 'long' }),
                   lpId: dup.lpId
                 });
@@ -1335,7 +1407,7 @@ const App = () => {
               </div>
               <div>
                 <p className="text-sm text-blue-800">
-                  <strong>Period {selectedSlot.period}:</strong> {periodToTimeString(selectedSlot.period, appSettings.periodTimes)}
+                  <strong>Period {selectedSlot.period}:</strong> {periodToTimeString(selectedSlot.period, memoizedSettings.periodTimes)}
                 </p>
               </div>
             </div>
@@ -1594,7 +1666,7 @@ const App = () => {
                             class: plan.class,
                             subject: plan.subject,
                             period: plan.session,
-                            date: new Date().toISOString().split('T')[0],
+                            date: todayIST(),
                             day: new Date().toLocaleDateString('en-US', { weekday: 'long' }),
                             lpId: plan.lpId
                           })}
@@ -1699,6 +1771,82 @@ const App = () => {
                         </td>
                       );
                     })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Day Timetable View (additional view requested) - shows timetable for a single day as a table
+  const DayTimetableView = ({ periodTimes }) => {
+    const [rows, setRows] = useState([]);
+    const [date, setDate] = useState(formatDateForInput(todayIST()));
+    const [loadingDay, setLoadingDay] = useState(false);
+    // Use the period times passed as props directly instead of maintaining separate state
+    const customPeriodTimes = periodTimes;
+
+    useEffect(() => {
+      async function fetchDay() {
+        try {
+          setLoadingDay(true);
+          const data = await api.getDailyTimetableWithSubstitutions(date);
+          // API returns { date, timetable } in some deployments, or an array
+          let table = [];
+          if (Array.isArray(data)) table = data;
+          else if (data && Array.isArray(data.timetable)) table = data.timetable;
+          setRows(table);
+        } catch (err) {
+          console.error('Failed to load day timetable', err);
+          setRows([]);
+        } finally {
+          setLoadingDay(false);
+        }
+      }
+      fetchDay();
+    }, [date]);
+
+    return (
+      <div className="space-y-6">
+        <div className="flex justify-between items-center">
+          <h1 className="text-2xl font-bold text-gray-900">Day Timetable</h1>
+          <div className="flex items-center space-x-2">
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="px-3 py-2 border rounded" />
+          </div>
+        </div>
+
+        <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+          <div className="px-6 py-4 border-b border-gray-200">
+            <h2 className="text-lg font-medium text-gray-900">Timetable for {formatLocalDate(date, { year: 'numeric', month: 'short', day: 'numeric', weekday: 'long' })}</h2>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Period</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Class</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Teacher</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Subject</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {loadingDay ? (
+                  <tr><td colSpan={6} className="px-6 py-4 text-center">Loading...</td></tr>
+                ) : rows.length === 0 ? (
+                  <tr><td colSpan={6} className="px-6 py-4 text-center">No timetable entries for this date.</td></tr>
+                ) : rows.map((r, i) => (
+                  <tr key={i}>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{r.period}</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{periodToTimeString(r.period, customPeriodTimes)}</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{r.class}</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{r.teacher || r.teacherName || ''}</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{r.subject || r.regularSubject || r.substituteSubject || ''}</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{r.isSubstitution ? 'Substitution' : 'Regular'}</td>
                   </tr>
                 ))}
               </tbody>
@@ -2047,17 +2195,35 @@ const App = () => {
     );
   };
 
-  // Substitutions View
+  // Enhanced Substitutions View for HM
   const SubstitutionsView = () => {
     const [substitutions, setSubstitutions] = useState([]);
+    const [dailyTimetable, setDailyTimetable] = useState([]);
     const [showForm, setShowForm] = useState(false);
+    const [loading, setLoading] = useState(false);
+    const [refreshing, setRefreshing] = useState(false);
+    
+    // Enhanced form state for better UX
+    const [selectedTeacherTimetable, setSelectedTeacherTimetable] = useState([]);
+    const [availableSubstitutes, setAvailableSubstitutes] = useState([]);
+    const [loadingTeacherTimetable, setLoadingTeacherTimetable] = useState(false);
+    
     // Data fetched from the API; initially empty
     const [absentTeachers, setAbsentTeachers] = useState([]);
     const [freeTeachers, setFreeTeachers] = useState([]);
     const [vacantSlots, setVacantSlots] = useState([]);
+    const [allTeachers, setAllTeachers] = useState([]);
+    const [allClasses, setAllClasses] = useState([]);
+
+    // Filters for timetable view
+    const [filters, setFilters] = useState({
+      teacher: '',
+      class: '',
+      date: todayIST()
+    });
 
     const [formData, setFormData] = useState({
-      date: new Date().toISOString().split('T')[0],
+      date: todayIST(),
       absentTeacher: '',
       period: '',
       class: '',
@@ -2066,51 +2232,224 @@ const App = () => {
       substituteSubject: ''
     });
 
-    // Fetch data for absent teachers, free teachers and vacant slots whenever date or period changes
+    // Helper function to refresh substitutions
+    const refreshSubstitutions = async (targetDate = null) => {
+      const dateToUse = targetDate || formData.date;
+      setRefreshing(true);
+      try {
+        // Try multiple endpoints for robustness
+        let subs = [];
+        
+        // Method 1: Direct substitutions endpoint
+        try {
+          console.log('🔍 Fetching substitutions for date:', dateToUse);
+          const direct = await api.getAssignedSubstitutions(dateToUse, { noCache: true });
+          console.log('🔍 API Response:', direct);
+          
+          if (direct && Array.isArray(direct.assignedSubstitutions)) {
+            subs = direct.assignedSubstitutions;
+            console.log('✅ Found', subs.length, 'substitutions:', subs);
+          } else {
+            console.log('⚠️ No assignedSubstitutions array in response');
+          }
+        } catch (e1) {
+          console.warn('getAssignedSubstitutions failed:', e1?.message || e1);
+        }
+        
+        // Method 2: Fallback to merged timetable if no direct results
+        if (subs.length === 0) {
+          try {
+            console.log('🔄 Trying fallback method...');
+            const merged = await api.getDailyTimetableWithSubstitutions(dateToUse, { noCache: true });
+            console.log('🔍 Merged timetable response:', merged);
+            
+            if (merged && Array.isArray(merged.timetable)) {
+              subs = merged.timetable.filter(item => item && item.isSubstitution);
+              console.log('✅ Found', subs.length, 'substitutions from timetable');
+            }
+          } catch (e2) {
+            console.warn('getDailyTimetableWithSubstitutions failed:', e2?.message || e2);
+          }
+        }
+        
+        console.log('🎯 Final substitutions to display:', subs);
+        setSubstitutions(subs);
+        return subs;
+      } catch (err) {
+        console.error('Error refreshing substitutions:', err);
+        return [];
+      } finally {
+        setRefreshing(false);
+      }
+    };
+
+    // Load daily timetable with substitutions for the filtered date
+    const loadDailyTimetable = async () => {
+      setLoading(true);
+      try {
+        // Get full timetable with filters
+        const timetableData = await api.getFullTimetableFiltered(
+          filters.class, 
+          '', 
+          filters.teacher, 
+          filters.date
+        );
+        
+        if (Array.isArray(timetableData)) {
+          setDailyTimetable(timetableData);
+        } else {
+          // Fallback to daily timetable with substitutions
+          const merged = await api.getDailyTimetableWithSubstitutions(filters.date);
+          if (merged && Array.isArray(merged.timetable)) {
+            let filtered = merged.timetable;
+            
+            // Apply client-side filters if needed
+            if (filters.teacher) {
+              filtered = filtered.filter(item => 
+                (item.teacher || '').toLowerCase().includes(filters.teacher.toLowerCase()) ||
+                (item.substituteTeacher || '').toLowerCase().includes(filters.teacher.toLowerCase())
+              );
+            }
+            
+            if (filters.class) {
+              filtered = filtered.filter(item => 
+                (item.class || '').toLowerCase().includes(filters.class.toLowerCase())
+              );
+            }
+            
+            setDailyTimetable(filtered);
+          } else {
+            setDailyTimetable([]);
+          }
+        }
+      } catch (err) {
+        console.error('Error loading daily timetable:', err);
+        setDailyTimetable([]);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    // Load teacher's timetable when teacher is selected in form
+    const loadTeacherTimetable = async (teacherEmail, date) => {
+      if (!teacherEmail || !date) {
+        setSelectedTeacherTimetable([]);
+        return;
+      }
+      
+      setLoadingTeacherTimetable(true);
+      try {
+        console.log('🔍 Loading teacher timetable for:', teacherEmail, 'on date:', date);
+        const timetable = await api.getTeacherDailyTimetable(teacherEmail, date);
+        console.log('🔍 Teacher timetable response:', timetable);
+        
+        if (timetable && Array.isArray(timetable.periods)) {
+          console.log('✅ Found', timetable.periods.length, 'periods for teacher');
+          setSelectedTeacherTimetable(timetable.periods);
+        } else {
+          console.log('⚠️ No periods found in response structure');
+          setSelectedTeacherTimetable([]);
+        }
+      } catch (err) {
+        console.error('❌ Error loading teacher timetable:', err);
+        setSelectedTeacherTimetable([]);
+      } finally {
+        setLoadingTeacherTimetable(false);
+      }
+    };
+
+    // Load available substitutes for a specific period
+    const loadAvailableSubstitutes = async (date, period) => {
+      if (!date || !period) {
+        setAvailableSubstitutes([]);
+        return;
+      }
+      
+      try {
+        const free = await api.getFreeTeachers(date, period, [formData.absentTeacher]);
+        setAvailableSubstitutes(Array.isArray(free) ? free : []);
+      } catch (err) {
+        console.error('Error loading available substitutes:', err);
+        setAvailableSubstitutes([]);
+      }
+    };
+
+    // Initial data load when component mounts
+    useEffect(() => {
+      async function initializeData() {
+        try {
+          // Load basic data
+          const [absents, teachers, classes] = await Promise.all([
+            api.getPotentialAbsentTeachers().catch(() => []),
+            api.getPotentialAbsentTeachers().catch(() => []), // Reuse for all teachers
+            api.getAllClasses().catch(() => [])
+          ]);
+          
+          setAbsentTeachers(Array.isArray(absents) ? absents : []);
+          setAllTeachers(Array.isArray(teachers) ? teachers : []);
+          setAllClasses(Array.isArray(classes) ? classes : []);
+          
+          // Load substitutions immediately
+          await refreshSubstitutions();
+          
+          // Load daily timetable
+          await loadDailyTimetable();
+          
+        } catch (err) {
+          console.error('Error initializing substitution data:', err);
+        }
+      }
+      
+      initializeData();
+    }, []); // Only run on mount
+
+    // Fetch data when form date changes
     useEffect(() => {
       async function fetchSubstitutionData() {
         try {
-          // Potential absent teachers (teachers who might be absent)
-          const absents = await api.getPotentialAbsentTeachers();
-          const absList = Array.isArray(absents) ? absents : [];
-          setAbsentTeachers(absList);
           // Build identifier list (prefer email when available)
-          const absentIds = absList.map(a => (a && (a.email || a.name)) || '').filter(Boolean);
-          // Vacant slots for the current date and absent teachers.  The
-          // API returns an object with a vacantSlots array and an
-          // assignedSubstitutions array.  Use the vacantSlots list for
-          // our display.  If absent teacher data is unavailable, fallback
-          // to an empty list.
+          const absentIds = absentTeachers.map(a => (a && (a.email || a.name)) || '').filter(Boolean);
+          
+          // Vacant slots for the current date and absent teachers
           const vacantRes = await api.getVacantSlotsForAbsent(formData.date, absentIds);
           const vacSlots = vacantRes && Array.isArray(vacantRes.vacantSlots) ? vacantRes.vacantSlots : [];
           setVacantSlots(vacSlots);
+          
           // Free teachers for the selected date/period and current absent list
           const free = await api.getFreeTeachers(formData.date, formData.period || '', absentIds);
           setFreeTeachers(Array.isArray(free) ? free : []);
-          // Get substitutions already assigned for the day (prefer direct endpoint)
-          try {
-            const direct = await api.getAssignedSubstitutions(formData.date, { noCache: true });
-            if (direct && Array.isArray(direct.assignedSubstitutions)) {
-              setSubstitutions(direct.assignedSubstitutions);
-            }
-          } catch (e1) {
-            console.warn('getAssignedSubstitutions failed in SubstitutionsView:', e1?.message || e1);
-          }
-          // Fallback to merged timetable
-          if (!substitutions || substitutions.length === 0) {
-            const subs = await api.getDailyTimetableWithSubstitutions(formData.date, { noCache: true });
-            if (subs && Array.isArray(subs.timetable)) {
-              setSubstitutions(subs.timetable);
-            } else {
-              setSubstitutions([]);
-            }
-          }
+          
+          // Refresh substitutions for the new date
+          await refreshSubstitutions(formData.date);
+          
         } catch (err) {
-          console.error(err);
+          console.error('Error fetching substitution data:', err);
         }
       }
-      fetchSubstitutionData();
-    }, [formData.date, formData.period]);
+      
+      if (absentTeachers.length > 0) {
+        fetchSubstitutionData();
+      }
+    }, [formData.date, formData.period, absentTeachers]);
+
+    // Load timetable when filters change
+    useEffect(() => {
+      loadDailyTimetable();
+    }, [filters.date, filters.teacher, filters.class]);
+
+    // Load teacher timetable when absent teacher is selected
+    useEffect(() => {
+      if (formData.absentTeacher && formData.date) {
+        loadTeacherTimetable(formData.absentTeacher, formData.date);
+      }
+    }, [formData.absentTeacher, formData.date]);
+
+    // Load available substitutes when period is selected
+    useEffect(() => {
+      if (formData.date && formData.period && formData.absentTeacher) {
+        loadAvailableSubstitutes(formData.date, formData.period);
+      }
+    }, [formData.date, formData.period, formData.absentTeacher]);
 
     const handleSubmitSubstitution = async (e) => {
       e.preventDefault();
@@ -2118,19 +2457,17 @@ const App = () => {
         // Persist the substitution using the global submit helper for
         // consistent UX.
         await withSubmit('Assigning substitution...', () => api.assignSubstitution(formData));
+        
         // Immediately refresh the substitution list for the selected date
-        try {
-          const subs = await api.getDailyTimetableWithSubstitutions(formData.date);
-          if (subs && Array.isArray(subs.timetable)) {
-            setSubstitutions(subs.timetable);
-          }
-        } catch (err) {
-          console.warn('Failed to refresh substitutions after assign:', err?.message || err);
-        }
+        await refreshSubstitutions(formData.date);
+        
+        // Also reload the daily timetable to show updates
+        await loadDailyTimetable();
+        
         // Close the form and reset inputs
         setShowForm(false);
         setFormData({
-          date: new Date().toISOString().split('T')[0],
+          date: todayIST(),
           absentTeacher: '',
           period: '',
           class: '',
@@ -2146,20 +2483,225 @@ const App = () => {
     return (
       <div className="space-y-6">
         <div className="flex justify-between items-center">
-          <h1 className="text-2xl font-bold text-gray-900">Substitutions</h1>
-          <button
-            onClick={() => setShowForm(true)}
-            className="bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center hover:bg-blue-700"
-          >
-            <Plus className="h-4 w-4 mr-2" />
-            Assign Substitution
-          </button>
+          <h1 className="text-2xl font-bold text-gray-900">Substitutions Management</h1>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                console.log('=== DEBUG INFO ===');
+                console.log('Current substitutions:', substitutions);
+                console.log('Current date filter:', formData.date);
+                console.log('Daily timetable:', dailyTimetable);
+                console.log('=================');
+                
+                // Debug the raw API response
+                Promise.all([
+                  api.getAssignedSubstitutions(formData.date, { noCache: true }),
+                  api.debugSubstitutions(formData.date, { noCache: true })
+                ]).then(([response, debugResponse]) => {
+                  console.log('🔍 NORMAL API RESPONSE:', response);
+                  console.log('🔧 DEBUG API RESPONSE:', debugResponse);
+                  
+                  if (debugResponse) {
+                    console.log('📊 Headers in sheet:', debugResponse.headers);
+                    console.log('📊 Total substitutions in sheet:', debugResponse.totalCount);
+                    console.log('📊 All substitutions:', debugResponse.allSubstitutions);
+                    console.log('📊 Target date:', debugResponse.targetDate);
+                    console.log('📊 Target date ISO:', debugResponse.targetDateISO);
+                    console.log('📊 Date conversion debug:', debugResponse.dateDebug);
+                    console.log('📊 Filtered for date:', debugResponse.filteredForDate);
+                  }
+                }).catch(err => console.error('❌ API Error:', err));
+                
+                alert(`Debug info logged to console. Found ${substitutions.length} substitutions. Check console for detailed API response.`);
+              }}
+              className="bg-yellow-100 text-yellow-800 rounded-lg px-3 py-2 flex items-center hover:bg-yellow-200 transition-colors duration-300"
+            >
+              🐛 Debug
+            </button>
+            <button
+              onClick={() => refreshSubstitutions()}
+              className="bg-gray-100 text-gray-900 rounded-lg px-3 py-2 flex items-center hover:bg-gray-200 transition-colors duration-300"
+              disabled={refreshing}
+            >
+              {refreshing ? (
+                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-current mr-2" />
+              ) : (
+                <RefreshCw className="h-4 w-4 mr-2" />
+              )}
+              Refresh
+            </button>
+            <button
+              onClick={() => setShowForm(true)}
+              className="bg-blue-600 text-white px-4 py-2 rounded-lg flex items-center hover:bg-blue-700"
+            >
+              <Plus className="h-4 w-4 mr-2" />
+              Assign Substitution
+            </button>
+          </div>
+        </div>
+
+        {/* Filters for Timetable View */}
+        <div className="bg-white rounded-xl shadow-sm p-6">
+          <h2 className="text-lg font-semibold mb-4">Daily Timetable with Substitutions</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
+              <input
+                type="date"
+                value={filters.date}
+                onChange={(e) => setFilters({...filters, date: e.target.value})}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Filter by Teacher</label>
+              <select
+                value={filters.teacher}
+                onChange={(e) => setFilters({...filters, teacher: e.target.value})}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+              >
+                <option value="">All Teachers</option>
+                {allTeachers.map((teacher, idx) => (
+                  <option key={`teacher-${idx}`} value={teacher.name || teacher.email}>
+                    {teacher.name || teacher.email}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Filter by Class</label>
+              <select
+                value={filters.class}
+                onChange={(e) => setFilters({...filters, class: e.target.value})}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+              >
+                <option value="">All Classes</option>
+                {allClasses.map((cls, idx) => (
+                  <option key={`class-${idx}`} value={cls}>
+                    {cls}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Daily Timetable Display */}
+          {loading ? (
+            <div className="flex justify-center p-6">
+              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Period</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Class</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Subject</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Regular Teacher</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Substitute Teacher</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {dailyTimetable.map((slot, index) => (
+                    <tr key={`timetable-${slot.period}-${slot.class}-${index}`} 
+                        className={slot.isSubstitution ? 'bg-yellow-50' : (index % 2 === 0 ? 'bg-white' : 'bg-gray-50')}>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{slot.period}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{slot.class}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{slot.subject}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {slot.isSubstitution ? (
+                          <span className="text-red-600 line-through">{slot.originalTeacher || slot.absentTeacher}</span>
+                        ) : (
+                          slot.teacher
+                        )}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        {slot.isSubstitution ? (
+                          <span className="text-green-600 font-medium">{slot.substituteTeacher || slot.teacher}</span>
+                        ) : (
+                          '-'
+                        )}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        {slot.isSubstitution ? (
+                          <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800">
+                            Substitution
+                          </span>
+                        ) : (
+                          <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
+                            Regular
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                  {dailyTimetable.length === 0 && (
+                    <tr>
+                      <td colSpan={6} className="px-6 py-4 text-center text-gray-500">
+                        No timetable data found for the selected filters.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        {/* Current Substitutions Summary */}
+        <div className="bg-white rounded-xl shadow-sm p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-medium text-gray-900">
+              Active Substitutions for {new Date(formData.date).toLocaleDateString()}
+            </h2>
+            <span className="bg-blue-100 text-blue-800 text-sm font-medium px-2.5 py-0.5 rounded">
+              {substitutions.length} substitution{substitutions.length !== 1 ? 's' : ''}
+            </span>
+          </div>
+          
+          {substitutions.length > 0 ? (
+            <div className="overflow-x-auto">
+              <table className="min-w-full">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Period</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Class</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Regular Teacher</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Subject</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Substitute Teacher</th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {substitutions.map((sub, index) => (
+                    <tr key={`sub-${sub.period}-${sub.class}-${sub.substituteTeacher || sub.teacher || index}`}>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{sub.period}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{sub.class}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        <span className="text-red-600">{sub.absentTeacher || sub.originalTeacher}</span>
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{sub.regularSubject || sub.subject}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                        <span className="text-green-600 font-medium">{sub.substituteTeacher || sub.teacher}</span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="text-center py-6 text-gray-500">
+              No substitutions assigned for this date.
+            </div>
+          )}
         </div>
 
         {showForm && (
           <div className="bg-white rounded-xl shadow-sm p-6">
             <h2 className="text-lg font-semibold mb-4">Assign Substitution</h2>
-            <form onSubmit={handleSubmitSubstitution} className="space-y-4">
+            <form onSubmit={handleSubmitSubstitution} className="space-y-6">
+              {/* Basic Details */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
@@ -2186,76 +2728,157 @@ const App = () => {
                     ))}
                   </select>
                 </div>
-                
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Period</label>
-                  <select
-                    value={formData.period}
-                    onChange={(e) => setFormData({...formData, period: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-                    required
-                  >
-                    <option value="">Select Period</option>
-                    <option value="1">Period 1</option>
-                    <option value="2">Period 2</option>
-                    <option value="3">Period 3</option>
-                    <option value="4">Period 4</option>
-                    <option value="5">Period 5</option>
-                  </select>
-                </div>
-                
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Class</label>
-                  <select
-                    value={formData.class}
-                    onChange={(e) => setFormData({...formData, class: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-                    required
-                  >
-                    <option value="">Select Class</option>
-                    <option value="10A">10A</option>
-                    <option value="10B">10B</option>
-                    <option value="11A">11A</option>
-                  </select>
-                </div>
-                
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Regular Subject</label>
-                  <input
-                    type="text"
-                    value={formData.regularSubject}
-                    onChange={(e) => setFormData({...formData, regularSubject: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-                    required
-                  />
-                </div>
-                
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Substitute Teacher</label>
-                  <select
-                    value={formData.substituteTeacher}
-                    onChange={(e) => setFormData({...formData, substituteTeacher: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-                    required
-                  >
-                    <option value="">Select Teacher</option>
-                    {freeTeachers.map(teacher => (
-                      <option key={(teacher.email||teacher.name)} value={(teacher.email||teacher.name)}>{teacher.name || teacher.email}</option>
-                    ))}
-                  </select>
-                </div>
-                
-                <div className="md:col-span-2">
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Substitute Subject</label>
-                  <input
-                    type="text"
-                    value={formData.substituteSubject}
-                    onChange={(e) => setFormData({...formData, substituteSubject: e.target.value})}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-                    required
-                  />
-                </div>
               </div>
+
+              {/* Teacher Timetable */}
+              {formData.absentTeacher && (
+                <div className="border rounded-lg p-4 bg-gray-50">
+                  <h3 className="text-md font-medium text-gray-900 mb-3">
+                    {formData.absentTeacher.split('@')[0]}'s Timetable for {formData.date}
+                  </h3>
+                  {loadingTeacherTimetable ? (
+                    <div className="flex justify-center p-4">
+                      <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600"></div>
+                    </div>
+                  ) : selectedTeacherTimetable.length > 0 ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
+                      {selectedTeacherTimetable.map((period, index) => (
+                        <div
+                          key={index}
+                          className={`p-3 rounded border cursor-pointer transition-colors ${
+                            formData.period === String(period.period) 
+                              ? 'bg-blue-100 border-blue-300' 
+                              : 'bg-white border-gray-200 hover:bg-gray-50'
+                          }`}
+                          onClick={() => setFormData({
+                            ...formData, 
+                            period: String(period.period),
+                            class: period.class || '',
+                            regularSubject: period.subject || ''
+                          })}
+                        >
+                          <div className="text-sm font-medium">Period {period.period}</div>
+                          <div className="text-xs text-gray-600">{period.class}</div>
+                          <div className="text-xs text-gray-600">{period.subject}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-gray-500 text-sm">No timetable available for this teacher</p>
+                  )}
+                </div>
+              )}
+
+              {/* Period Selection and Subject Details */}
+              {formData.absentTeacher && (
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Period</label>
+                    <select
+                      value={formData.period}
+                      onChange={(e) => setFormData({...formData, period: e.target.value})}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                      required
+                    >
+                      <option value="">Select Period</option>
+                      <option value="1">Period 1</option>
+                      <option value="2">Period 2</option>
+                      <option value="3">Period 3</option>
+                      <option value="4">Period 4</option>
+                      <option value="5">Period 5</option>
+                      <option value="6">Period 6</option>
+                      <option value="7">Period 7</option>
+                      <option value="8">Period 8</option>
+                    </select>
+                  </div>
+                  
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Class</label>
+                    <select
+                      value={formData.class}
+                      onChange={(e) => setFormData({...formData, class: e.target.value})}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                      required
+                    >
+                      <option value="">Select Class</option>
+                      {allClasses.map((cls, idx) => (
+                        <option key={`form-class-${idx}`} value={cls}>{cls}</option>
+                      ))}
+                    </select>
+                  </div>
+                  
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Regular Subject</label>
+                    <input
+                      type="text"
+                      value={formData.regularSubject}
+                      onChange={(e) => setFormData({...formData, regularSubject: e.target.value})}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                      required
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Available Substitutes */}
+              {formData.period && formData.absentTeacher && (
+                <div className="border rounded-lg p-4 bg-green-50">
+                  <h3 className="text-md font-medium text-gray-900 mb-3">
+                    Available Teachers for Period {formData.period}
+                  </h3>
+                  {availableSubstitutes.length > 0 ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                      {availableSubstitutes.map((teacher, index) => (
+                        <div
+                          key={index}
+                          className={`p-3 rounded border cursor-pointer transition-colors ${
+                            formData.substituteTeacher === (teacher.email || teacher.name) 
+                              ? 'bg-green-200 border-green-400' 
+                              : 'bg-white border-gray-200 hover:bg-green-100'
+                          }`}
+                          onClick={() => setFormData({
+                            ...formData, 
+                            substituteTeacher: teacher.email || teacher.name,
+                            substituteSubject: formData.regularSubject // Default to same subject
+                          })}
+                        >
+                          <div className="text-sm font-medium">{teacher.name || teacher.email}</div>
+                          <div className="text-xs text-gray-600">Available</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-gray-500 text-sm">No teachers available for this period</p>
+                  )}
+                </div>
+              )}
+
+              {/* Substitute Details */}
+              {formData.substituteTeacher && (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Substitute Teacher</label>
+                    <input
+                      type="text"
+                      value={formData.substituteTeacher}
+                      onChange={(e) => setFormData({...formData, substituteTeacher: e.target.value})}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-gray-50"
+                      readOnly
+                    />
+                  </div>
+                  
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Substitute Subject</label>
+                    <input
+                      type="text"
+                      value={formData.substituteSubject}
+                      onChange={(e) => setFormData({...formData, substituteSubject: e.target.value})}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                      required
+                    />
+                  </div>
+                </div>
+              )}
               
               <div className="flex justify-end space-x-3 pt-4">
                 <button
@@ -2263,7 +2886,7 @@ const App = () => {
                   onClick={() => {
                     setShowForm(false);
                     setFormData({
-                      date: new Date().toISOString().split('T')[0],
+                      date: todayIST(),
                       absentTeacher: '',
                       period: '',
                       class: '',
@@ -2271,6 +2894,8 @@ const App = () => {
                       substituteTeacher: '',
                       substituteSubject: ''
                     });
+                    setSelectedTeacherTimetable([]);
+                    setAvailableSubstitutes([]);
                   }}
                   className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
                 >
@@ -2279,6 +2904,7 @@ const App = () => {
                 <button
                   type="submit"
                   className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                  disabled={!formData.absentTeacher || !formData.period || !formData.substituteTeacher}
                 >
                   Assign Substitution
                 </button>
@@ -2286,83 +2912,6 @@ const App = () => {
             </form>
           </div>
         )}
-
-        <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-          <div className="px-6 py-4 border-b border-gray-200">
-            <h2 className="text-lg font-medium text-gray-900 mb-4">Substitutions for {formData.date}</h2>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-gray-200">
-              <thead className="bg-gray-50">
-                <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Period</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Class</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Teacher</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Subject</th>
-                </tr>
-              </thead>
-              <tbody className="bg-white divide-y divide-gray-200">
-                {substitutions.map((sub, index) => (
-                  <tr key={index}>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{sub.period}</td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{sub.class}</td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{sub.teacher}</td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{sub.subject}</td>
-                  </tr>
-                ))}
-                {substitutions.length === 0 && (
-                  <tr>
-                    <td colSpan={4} className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center">
-                      No substitutions assigned for this date.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <div className="bg-white rounded-xl shadow-sm p-6">
-            <h2 className="text-lg font-medium text-gray-900 mb-4">Vacant Slots</h2>
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-gray-50">
-                  <tr>
-                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Period</th>
-                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Class</th>
-                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Absent Teacher</th>
-                    <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">Subject</th>
-                  </tr>
-                </thead>
-                <tbody className="bg-white divide-y divide-gray-200">
-                  {vacantSlots.map((slot, index) => (
-                    <tr key={index}>
-                      <td className="px-4 py-2 text-sm text-gray-900">{slot.period}</td>
-                      <td className="px-4 py-2 text-sm text-gray-900">{slot.class}</td>
-                      <td className="px-4 py-2 text-sm text-gray-900">{slot.absentTeacher}</td>
-                      <td className="px-4 py-2 text-sm text-gray-900">{slot.regularSubject}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-          
-          <div className="bg-white rounded-xl shadow-sm p-6">
-            <h2 className="text-lg font-medium text-gray-900 mb-4">Free Teachers</h2>
-            <div className="space-y-2">
-              {freeTeachers.map((teacher, index) => (
-                <div key={index} className="flex items-center p-3 bg-gray-50 rounded-lg">
-                  <div className="p-2 bg-blue-100 rounded-lg mr-3">
-                    <UserCircle className="w-5 h-5 text-blue-600" />
-                  </div>
-                  <span className="font-medium text-gray-900">{teacher.name || teacher.email}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
       </div>
     );
   };
@@ -2589,7 +3138,7 @@ const App = () => {
       subject: '',
       internalMax: 20,
       externalMax: 80,
-      date: new Date().toISOString().split('T')[0]
+      date: todayIST()
     });
     const [availableClasses, setAvailableClasses] = useState([]);
     // List of grading schemes loaded from the GradeTypes sheet.  Each entry
@@ -2644,57 +3193,80 @@ const App = () => {
       fetchData();
     }, [user]);
 
-    // Recompute available subjects when the selected class, user or exams change
+    // Load subjects from centralized API
     useEffect(() => {
-      const cls = (examFormData.class || '').toString().trim();
-      
-      // If user is a teacher (not HM), restrict to their subjects
-      if (user && !hasRole('h m')) {
-        const teacherSubjects = Array.isArray(user.subjects) ? user.subjects : [];
-        setAvailableSubjects(teacherSubjects);
-        return;
+      async function fetchAllSubjects() {
+        try {
+          // Get all available subjects from the centralized API endpoint
+          const allSubjects = await api.getSubjects();
+          
+          // If user is a teacher (not HM), restrict to their subjects
+          if (user && !hasRole('h m')) {
+            const teacherSubjects = Array.isArray(user.subjects) ? user.subjects : [];
+            setAvailableSubjects(teacherSubjects);
+          } else {
+            // Headmaster: show all subjects
+            setAvailableSubjects(allSubjects);
+          }
+        } catch (error) {
+          console.error("Error fetching subjects:", error);
+          fallbackToExamBasedSubjects();
+        }
       }
-
-      // Headmaster: derive subjects from the fetched exams for the selected class
-      const subjectsSet = new Set();
-      if (Array.isArray(exams)) {
-        // First pass: add subjects for the selected class
-        let matchingClassCount = 0;
-        exams.forEach(ex => {
-          if (!ex) return;
-          if (cls) {
-            if (String(ex.class || '').trim() === cls) {
-              matchingClassCount++;
+      
+      // Fallback method if API call fails
+      function fallbackToExamBasedSubjects() {
+        const cls = (examFormData.class || '').toString().trim();
+        
+        // If user is a teacher (not HM), restrict to their subjects
+        if (user && !hasRole('h m')) {
+          const teacherSubjects = Array.isArray(user.subjects) ? user.subjects : [];
+          setAvailableSubjects(teacherSubjects);
+          return;
+        }
+  
+        // Headmaster: derive subjects from the fetched exams for the selected class
+        const subjectsSet = new Set();
+        if (Array.isArray(exams)) {
+          // First pass: add subjects for the selected class
+          let matchingClassCount = 0;
+          exams.forEach(ex => {
+            if (!ex) return;
+            if (cls) {
+              if (String(ex.class || '').trim() === cls) {
+                matchingClassCount++;
+                const subj = String(ex.subject || '').trim();
+                if (subj) subjectsSet.add(subj);
+              }
+            } else {
               const subj = String(ex.subject || '').trim();
               if (subj) subjectsSet.add(subj);
             }
-          } else {
-            const subj = String(ex.subject || '').trim();
-            if (subj) subjectsSet.add(subj);
-          }
-        });
-        // If no subjects found and a class is selected, fall back to all subjects
-        if (subjectsSet.size === 0 && cls) {
-          exams.forEach(ex => {
-            if (!ex) return;
-            const subj = String(ex.subject || '').trim();
-            if (subj) subjectsSet.add(subj);
           });
+          // If no subjects found and a class is selected, fall back to all subjects
+          if (subjectsSet.size === 0 && cls) {
+            exams.forEach(ex => {
+              if (!ex) return;
+              const subj = String(ex.subject || '').trim();
+              if (subj) subjectsSet.add(subj);
+            });
+          }
         }
-      }
-
-      // Add default subjects if no subjects found
-      if (subjectsSet.size === 0) {
-        const defaults = ['Mathematics', 'English', 'Science', 'History', 'Geography', 'Art'];
-        defaults.forEach(s => subjectsSet.add(s));
-        if (typeof window !== 'undefined' && console.debug) {
-          console.debug('DEBUG: No subjects found in exams, adding defaults:', defaults);
+  
+        // No default subjects - just warn if no subjects found
+        if (subjectsSet.size === 0) {
+          if (typeof window !== 'undefined' && console.debug) {
+            console.debug('DEBUG: No subjects found in exams');
+          }
         }
+  
+        const list = Array.from(subjectsSet).filter(Boolean).sort();
+        setAvailableSubjects(list);
       }
-
-      const list = Array.from(subjectsSet).filter(Boolean).sort();
-      setAvailableSubjects(list);
-    }, [examFormData.class, user, exams]);
+      
+      // Call the function to fetch subjects
+      fetchAllSubjects();
+    }, [examFormData.class, user, exams, hasRole]);
 
     // Handlers for Exam Creation
     const handleExamFormChange = (field, value) => {
@@ -2733,7 +3305,7 @@ const App = () => {
         const examList = await api.getExams();
         setExams(Array.isArray(examList) ? examList : []);
         setShowExamForm(false);
-        setExamFormData({ examType: '', class: '', subject: '', internalMax: 20, externalMax: 80, date: new Date().toISOString().split('T')[0] });
+        setExamFormData({ examType: '', class: '', subject: '', internalMax: 20, externalMax: 80, date: todayIST() });
       } catch (err) {
         console.error('Error creating exam:', err);
       }
@@ -2931,8 +3503,8 @@ const App = () => {
   // Use a stronger normalization that removes spaces and non-alphanumeric
   // characters so values like "6 A" and "6A" match reliably.
   const normKey = (s) => (s || '').toString().toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
-  const normalize = (s) => (s || '').toString().trim().toLowerCase();
-  const userRolesNorm = (user?.roles || []).map(r => normalize(r));
+  // Use appNormalize defined at the top level of the app
+  const userRolesNorm = (user?.roles || []).map(r => appNormalize(r));
   const userClassesSet = new Set((user?.classes || []).map(c => normKey(c)));
   const userSubjectsSet = new Set((user?.subjects || []).map(s => normKey(s)));
 
@@ -3095,7 +3667,7 @@ const App = () => {
                   type="button"
                   onClick={() => {
                     setShowExamForm(false);
-                    setExamFormData({ examType: '', class: '', subject: '', internalMax: 20, externalMax: 80, date: new Date().toISOString().split('T')[0] });
+                    setExamFormData({ examType: '', class: '', subject: '', internalMax: 20, externalMax: 80, date: todayIST() });
                   }}
                   className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
                 >
@@ -3237,13 +3809,13 @@ const App = () => {
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
                 {exams.map((exam) => {
-                  const normalize = (s) => (s || '').toString().trim().toLowerCase();
+                  // Use appNormalize defined at the top level of the app
                   // Determine permissions: HM can enter for any exam; Class Teacher by class; regular Teacher by class+subject
                   const isHm = hasRole('h m');
                   const isClassTeacher = hasRole('class teacher') || hasAnyRole(['classteacher']);
                   const isSubjectTeacher = hasAnyRole(['teacher']);
-                  const teachesClass = new Set((user?.classes||[]).map(c => normalize(c))).has(normalize(exam.class));
-                  const teachesSubject = new Set((user?.subjects||[]).map(s => normalize(s))).has(normalize(exam.subject));
+                  const teachesClass = new Set((user?.classes||[]).map(c => appNormalize(c))).has(appNormalize(exam.class));
+                  const teachesSubject = new Set((user?.subjects||[]).map(s => appNormalize(s))).has(appNormalize(exam.subject));
                   let canEnter = false;
                   if (!user) canEnter = false;
                   else if (isHm) canEnter = true;
@@ -3364,7 +3936,7 @@ const App = () => {
     const className = user?.classTeacherFor || '';
     // Attendance form state
     const [showAttendanceForm, setShowAttendanceForm] = useState(false);
-    const [attendanceDate, setAttendanceDate] = useState(new Date().toISOString().split('T')[0]);
+    const [attendanceDate, setAttendanceDate] = useState(todayIST());
     const [attendanceRows, setAttendanceRows] = useState([]);
     // Performance data
     const [performance, setPerformance] = useState([]);
@@ -3633,7 +4205,7 @@ const App = () => {
       }
     };
 
-    const handleFilterChange = (field, value) => {
+    const handlePlanFilterChange = (field, value) => {
       setFilters(prev => ({ ...prev, [field]: value }));
     };
 
@@ -3659,7 +4231,7 @@ const App = () => {
               <input
                 type="text"
                 value={filters.teacher}
-                onChange={(e) => handleFilterChange('teacher', e.target.value)}
+                onChange={(e) => handleReportFilterChange('teacher', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg"
                 placeholder="Search teacher"
               />
@@ -3669,7 +4241,7 @@ const App = () => {
               <input
                 type="text"
                 value={filters.class}
-                onChange={(e) => handleFilterChange('class', e.target.value)}
+                onChange={(e) => handleReportFilterChange('class', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg"
                 placeholder="e.g. 10A"
               />
@@ -3679,7 +4251,7 @@ const App = () => {
               <input
                 type="text"
                 value={filters.subject}
-                onChange={(e) => handleFilterChange('subject', e.target.value)}
+                onChange={(e) => handleReportFilterChange('subject', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg"
                 placeholder="e.g. Mathematics"
               />
@@ -3688,7 +4260,7 @@ const App = () => {
               <label className="block text-sm font-medium text-gray-700 mb-1">Status</label>
               <select
                 value={filters.status}
-                onChange={(e) => handleFilterChange('status', e.target.value)}
+                onChange={(e) => handleReportFilterChange('status', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg"
               >
                 <option value="">All</option>
@@ -3804,7 +4376,7 @@ const App = () => {
       }
     };
 
-    const handleFilterChange = (field, value) => {
+    const handleReportFilterChange = (field, value) => {
       setFilters(prev => ({ ...prev, [field]: value }));
     };
 
@@ -3830,7 +4402,7 @@ const App = () => {
               <input
                 type="text"
                 value={filters.teacher}
-                onChange={(e) => handleFilterChange('teacher', e.target.value)}
+                onChange={(e) => handleReportFilterChange('teacher', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg"
                 placeholder="Search teacher"
               />
@@ -3840,7 +4412,7 @@ const App = () => {
               <input
                 type="text"
                 value={filters.class}
-                onChange={(e) => handleFilterChange('class', e.target.value)}
+                onChange={(e) => handleReportFilterChange('class', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg"
                 placeholder="e.g. 10A"
               />
@@ -3850,7 +4422,7 @@ const App = () => {
               <input
                 type="text"
                 value={filters.subject}
-                onChange={(e) => handleFilterChange('subject', e.target.value)}
+                onChange={(e) => handleReportFilterChange('subject', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg"
                 placeholder="e.g. Mathematics"
               />
@@ -3860,7 +4432,7 @@ const App = () => {
               <input
                 type="date"
                 value={filters.date}
-                onChange={(e) => handleFilterChange('date', e.target.value)}
+                onChange={(e) => handleReportFilterChange('date', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg"
               />
             </div>
@@ -3869,7 +4441,7 @@ const App = () => {
               <input
                 type="date"
                 value={filters.fromDate}
-                onChange={(e) => handleFilterChange('fromDate', e.target.value)}
+                onChange={(e) => handleReportFilterChange('fromDate', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg"
               />
             </div>
@@ -3878,7 +4450,7 @@ const App = () => {
               <input
                 type="date"
                 value={filters.toDate}
-                onChange={(e) => handleFilterChange('toDate', e.target.value)}
+                onChange={(e) => handleReportFilterChange('toDate', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg"
               />
             </div>
@@ -3886,7 +4458,7 @@ const App = () => {
               <label className="block text-sm font-medium text-gray-700 mb-1">Status</label>
               <select
                 value={filters.status}
-                onChange={(e) => handleFilterChange('status', e.target.value)}
+                onChange={(e) => handleReportFilterChange('status', e.target.value)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg"
               >
                 <option value="">All</option>
@@ -4021,3 +4593,5 @@ const App = () => {
 }
 
 export default App;
+
+

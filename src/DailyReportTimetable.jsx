@@ -5,8 +5,9 @@ import {
   getTeacherDailyReportsForDate,
   submitDailyReport,
   getApprovedLessonPlansForReport,
+  getTeacherLessonDelays,
 } from "./api";
-import { todayLocalISO, formatLocalDate, periodToTimeString } from "./utils/dateUtils";
+import { todayIST, formatLocalDate, periodToTimeString } from "./utils/dateUtils";
 
 const COMPLETION = [
   "Not Started",
@@ -20,14 +21,21 @@ const PLAN_TYPES = [
 ];
 
 export default function DailyReportTimetable({ user }) {
-  const [date, setDate] = useState(todayLocalISO());
+  const [date, setDate] = useState(todayIST());
   const [rows, setRows] = useState([]);              // timetable rows for the day
   const [statusMap, setStatusMap] = useState({});    // key -> "Submitted" | "Not Submitted"
   const [drafts, setDrafts] = useState({});          // key -> { planType, lessonPlanId, chapter, objectives, activities, completed, notes }
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState({});          // key -> boolean
   const [message, setMessage] = useState("");        // top level message
-  const [lessonPlans, setLessonPlans] = useState({}); // key -> array of approved lesson plans for class/subject
+  const [periods, setPeriods] = useState([]);
+  const [reports, setReports] = useState([]);
+  const [selectedPeriod, setSelectedPeriod] = useState(null);
+  const [reportDetails, setReportDetails] = useState({});
+  const [lessonPlansMap, setLessonPlansMap] = useState({});
+  const [error, setError] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [lessonDelays, setLessonDelays] = useState([]);
 
   const email = user?.email || "";
   const teacherName = user?.name || "";
@@ -49,17 +57,46 @@ export default function DailyReportTimetable({ user }) {
   }
 
   async function load() {
-    if (!email) return;
+    if (!email) {
+      console.log('❌ No email provided for timetable load');
+      return;
+    }
     setLoading(true);
     setMessage("");
     try {
-      const [tt, rep] = await Promise.all([
+      console.log('🔍 Loading timetable for:', { email, date, user });
+      
+      // Start all initial API calls in parallel
+      const [tt, rep, delays] = await Promise.all([
         getTeacherDailyTimetable(email, date),            // [{period, class, subject, teacherName, chapter}]
         getTeacherDailyReportsForDate(email, date),       // [{class, subject, period, planType, lessonPlanId, status}]
+        getTeacherLessonDelays(teacherName).catch(err => {
+          console.warn("Could not load lesson delays:", err);
+          return [];
+        })
       ]);
 
-      // Normalize timetable list
-      const ttList = Array.isArray(tt) ? tt : [];
+      console.log('📅 Timetable response:', tt);
+      console.log('📝 Reports response:', rep);
+      console.log('⏰ Delays response:', delays);
+      console.log('🐛 Debug info from API:', tt?.debug);
+
+      // Set delays immediately
+      setLessonDelays(delays || []);
+
+      // Normalize timetable list - handle both array and structured response
+      let ttList = [];
+      if (Array.isArray(tt)) {
+        ttList = tt;
+      } else if (tt && Array.isArray(tt.periods)) {
+        ttList = tt.periods;
+      } else if (tt && tt.data && Array.isArray(tt.data)) {
+        ttList = tt.data;
+      } else {
+        console.log('⚠️ Unexpected timetable response format:', tt);
+      }
+      
+      console.log('📚 Normalized timetable list:', ttList);
       setRows(ttList);
 
       // status map: Submitted/Not Submitted
@@ -69,7 +106,7 @@ export default function DailyReportTimetable({ user }) {
       });
       setStatusMap(sm);
 
-      // Fetch lesson plans for each unique class/subject combination
+      // Fetch lesson plans for each unique class/subject combination (OPTIMIZED - parallel calls)
       const lessonPlansMap = {};
       const uniqueClassSubjects = new Set();
       ttList.forEach(r => {
@@ -79,12 +116,25 @@ export default function DailyReportTimetable({ user }) {
         }
       });
 
-      for (const key of uniqueClassSubjects) {
+      // Fetch all lesson plans in parallel instead of sequentially
+      console.log('📋 Fetching lesson plans for', uniqueClassSubjects.size, 'class/subject combinations...');
+      const lessonPlanPromises = Array.from(uniqueClassSubjects).map(async (key) => {
         const [cls, subject] = key.split('|');
-        const plans = await fetchLessonPlans(cls, subject);
+        try {
+          const plans = await fetchLessonPlans(cls, subject);
+          return [key, plans];
+        } catch (err) {
+          console.warn(`Failed to fetch lesson plans for ${cls}/${subject}:`, err);
+          return [key, []];
+        }
+      });
+
+      const lessonPlanResults = await Promise.all(lessonPlanPromises);
+      lessonPlanResults.forEach(([key, plans]) => {
         lessonPlansMap[key] = plans;
-      }
-      setLessonPlans(lessonPlansMap);
+      });
+      setLessonPlansMap(lessonPlansMap);
+      console.log('✅ Lesson plans loaded for', Object.keys(lessonPlansMap).length, 'combinations');
 
       // initialize drafts for not-submitted rows
       const nextDrafts = {};
@@ -104,10 +154,13 @@ export default function DailyReportTimetable({ user }) {
       });
       setDrafts(nextDrafts);
 
-      if (!ttList.length) setMessage("No periods on this day.");
+      if (!ttList.length) {
+        const debugInfo = tt?.debug || {};
+        setMessage(`No periods on this day. Debug: Found ${debugInfo.regularPeriodsFound || 0} regular periods and ${debugInfo.substitutionPeriodsFound || 0} substitution periods for ${debugInfo.dayName || 'unknown day'}.`);
+      }
     } catch (e) {
-      console.error(e);
-      setMessage("Unable to load timetable or reports.");
+      console.error('❌ Error loading timetable:', e);
+      setMessage(`Unable to load timetable or reports. Error: ${e.message || e}`);
     } finally {
       setLoading(false);
     }
@@ -124,7 +177,7 @@ export default function DailyReportTimetable({ user }) {
     if (!r) return;
 
     const plansKey = `${r.class}|${r.subject}`;
-    const selectedPlan = lessonPlans[plansKey]?.find(plan => plan.lpId === lessonPlanId);
+    const selectedPlan = lessonPlansMap[plansKey]?.find(plan => plan.lpId === lessonPlanId);
 
     if (selectedPlan) {
       setDrafts(prev => ({
@@ -189,7 +242,7 @@ export default function DailyReportTimetable({ user }) {
       };
 
       const res = await submitDailyReport(payload);
-      if (res && res.submitted) {
+      if (res && (res.ok || res.submitted)) {
         // mark as submitted
         setStatusMap(m => ({ ...m, [k]: "Submitted" }));
         // clear draft for that row
@@ -229,8 +282,10 @@ export default function DailyReportTimetable({ user }) {
         <h2 className="text-xl font-semibold text-gray-900">Daily Reporting</h2>
         <div className="flex items-center space-x-4">
           <div className="flex items-center space-x-2">
-            <label className="text-sm font-medium text-gray-700">Date:</label>
+            <label htmlFor="daily-report-date" className="text-sm font-medium text-gray-700">Date:</label>
             <input
+              id="daily-report-date"
+              name="daily-report-date"
               type="date"
               value={date}
               onChange={e => setDate(e.target.value)}
@@ -244,6 +299,19 @@ export default function DailyReportTimetable({ user }) {
           >
             {loading ? "Loading..." : "Refresh"}
           </button>
+          <button 
+            className="bg-gray-600 text-white px-4 py-2 rounded-md hover:bg-gray-700 text-sm font-medium transition-colors" 
+            onClick={async () => {
+              try {
+                const result = await getTeacherDailyTimetable(email, date);
+                alert(`API Response: ${JSON.stringify(result, null, 2)}`);
+              } catch (err) {
+                alert(`API Error: ${err.message}`);
+              }
+            }}
+          >
+            Test API
+          </button>
           {rows.length > 0 && (
             <button 
               className="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 text-sm font-medium transition-colors"
@@ -254,6 +322,25 @@ export default function DailyReportTimetable({ user }) {
           )}
         </div>
       </div>
+
+      {/* Show lesson delays if any */}
+      {lessonDelays.length > 0 && (
+        <div className="mb-4 bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <div className="flex items-center">
+            <div className="flex-shrink-0">
+              <svg className="h-5 w-5 text-yellow-400" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+              </svg>
+            </div>
+            <div className="ml-3">
+              <h3 className="text-sm font-medium text-yellow-800">Lesson Progress Delays</h3>
+              <div className="mt-2 text-sm text-yellow-700">
+                <p>You have {lessonDelays.length} lesson(s) with completion delays. Consider reviewing your lesson progress.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {displayDate && (
         <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
@@ -313,6 +400,8 @@ export default function DailyReportTimetable({ user }) {
                       <td className="px-4 py-3">
                         <div className="space-y-2">
                           <select
+                            id={`planType-${k}`}
+                            name={`planType-${k}`}
                             value={d.planType || "not planned"}
                             disabled={submitted}
                             onChange={e => setDraft(k, "planType", e.target.value)}
@@ -324,13 +413,15 @@ export default function DailyReportTimetable({ user }) {
                           </select>
                           {d.planType === "in plan" && (
                             <select
+                              id={`lessonPlan-${k}`}
+                              name={`lessonPlan-${k}`}
                               value={d.lessonPlanId || ""}
                               disabled={submitted}
                               onChange={e => handleLessonPlanChange(k, e.target.value)}
                               className="w-full text-sm border border-gray-300 rounded px-2 py-1 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 disabled:bg-gray-100"
                             >
                               <option value="">Select Lesson Plan</option>
-                              {(lessonPlans[`${r.class}|${r.subject}`] || []).map(plan => (
+                              {(lessonPlansMap[`${r.class}|${r.subject}`] || []).map(plan => (
                                 <option key={plan.lpId} value={plan.lpId}>
                                   {plan.chapter} (Session {plan.session})
                                 </option>
@@ -341,6 +432,8 @@ export default function DailyReportTimetable({ user }) {
                       </td>
                       <td className="px-4 py-3">
                         <input
+                          id={`chapter-${k}`}
+                          name={`chapter-${k}`}
                           type="text"
                           placeholder="Chapter name"
                           disabled={submitted}
@@ -351,6 +444,8 @@ export default function DailyReportTimetable({ user }) {
                       </td>
                       <td className="px-4 py-3">
                         <textarea
+                          id={`objectives-${k}`}
+                          name={`objectives-${k}`}
                           placeholder="Brief objectives"
                           disabled={submitted}
                           value={d.objectives || ""}
@@ -361,6 +456,8 @@ export default function DailyReportTimetable({ user }) {
                       </td>
                       <td className="px-4 py-3">
                         <textarea
+                          id={`activities-${k}`}
+                          name={`activities-${k}`}
                           placeholder="What was done"
                           disabled={submitted}
                           value={d.activities || ""}
@@ -371,6 +468,8 @@ export default function DailyReportTimetable({ user }) {
                       </td>
                       <td className="px-4 py-3">
                         <select
+                          id={`completed-${k}`}
+                          name={`completed-${k}`}
                           value={d.completed || "Not Started"}
                           disabled={submitted}
                           onChange={e => setDraft(k, "completed", e.target.value)}
@@ -383,6 +482,8 @@ export default function DailyReportTimetable({ user }) {
                       </td>
                       <td className="px-4 py-3">
                         <textarea
+                          id={`notes-${k}`}
+                          name={`notes-${k}`}
                           placeholder="Extra notes"
                           disabled={submitted}
                           value={d.notes || ""}
