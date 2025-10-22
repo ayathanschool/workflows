@@ -1048,6 +1048,14 @@ const App = () => {
       activities: '',
       notes: ''
     });
+    
+    // Filter states for lesson plans
+    const [lessonPlanFilters, setLessonPlanFilters] = useState({
+      class: '',
+      subject: '',
+      status: '',
+      chapter: ''
+    });
     // Helper: normalize weekday names (tolerates typos like "Wedbnesday")
     const normalizeDayNameClient = (input) => {
       if (!input && input !== 0) return '';
@@ -1621,6 +1629,74 @@ const App = () => {
           <div className="px-6 py-4 border-b border-gray-200">
             <h2 className="text-lg font-medium text-gray-900">Your Submitted Lesson Plans</h2>
             <p className="text-sm text-gray-500 mt-1">View and manage all your submitted lesson plans</p>
+            
+            {/* Filter Controls */}
+            <div className="flex flex-wrap gap-4 mt-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Class</label>
+                <select
+                  value={lessonPlanFilters.class}
+                  onChange={(e) => setLessonPlanFilters({...lessonPlanFilters, class: e.target.value})}
+                  className="min-w-[120px] border border-gray-300 rounded-md px-3 py-2 text-sm"
+                >
+                  <option value="">All Classes</option>
+                  {[...new Set(lessonPlans.map(plan => plan.class))].sort().map(cls => (
+                    <option key={cls} value={cls}>{cls}</option>
+                  ))}
+                </select>
+              </div>
+              
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Subject</label>
+                <select
+                  value={lessonPlanFilters.subject}
+                  onChange={(e) => setLessonPlanFilters({...lessonPlanFilters, subject: e.target.value})}
+                  className="min-w-[120px] border border-gray-300 rounded-md px-3 py-2 text-sm"
+                >
+                  <option value="">All Subjects</option>
+                  {[...new Set(lessonPlans.map(plan => plan.subject))].sort().map(subject => (
+                    <option key={subject} value={subject}>{subject}</option>
+                  ))}
+                </select>
+              </div>
+              
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Status</label>
+                <select
+                  value={lessonPlanFilters.status}
+                  onChange={(e) => setLessonPlanFilters({...lessonPlanFilters, status: e.target.value})}
+                  className="min-w-[120px] border border-gray-300 rounded-md px-3 py-2 text-sm"
+                >
+                  <option value="">All Status</option>
+                  {[...new Set(lessonPlans.map(plan => plan.status))].sort().map(status => (
+                    <option key={status} value={status}>{status}</option>
+                  ))}
+                </select>
+              </div>
+              
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Chapter</label>
+                <select
+                  value={lessonPlanFilters.chapter}
+                  onChange={(e) => setLessonPlanFilters({...lessonPlanFilters, chapter: e.target.value})}
+                  className="min-w-[120px] border border-gray-300 rounded-md px-3 py-2 text-sm"
+                >
+                  <option value="">All Chapters</option>
+                  {[...new Set(lessonPlans.map(plan => plan.chapter).filter(Boolean))].sort().map(chapter => (
+                    <option key={chapter} value={chapter}>{chapter}</option>
+                  ))}
+                </select>
+              </div>
+              
+              <div className="flex items-end">
+                <button
+                  onClick={() => setLessonPlanFilters({ class: '', subject: '', status: '', chapter: '' })}
+                  className="px-3 py-2 text-sm text-gray-600 hover:text-gray-800 border border-gray-300 rounded-md hover:bg-gray-50"
+                >
+                  Clear Filters
+                </button>
+              </div>
+            </div>
           </div>
           <div className="overflow-x-auto">
             <table className="min-w-full divide-y divide-gray-200">
@@ -1635,7 +1711,16 @@ const App = () => {
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
-                {lessonPlans.map((plan) => {
+                {lessonPlans
+                  .filter(plan => {
+                    return (
+                      (!lessonPlanFilters.class || plan.class === lessonPlanFilters.class) &&
+                      (!lessonPlanFilters.subject || plan.subject === lessonPlanFilters.subject) &&
+                      (!lessonPlanFilters.status || plan.status === lessonPlanFilters.status) &&
+                      (!lessonPlanFilters.chapter || plan.chapter === lessonPlanFilters.chapter)
+                    );
+                  })
+                  .map((plan) => {
                   // Get scheme info if available
                   const relatedScheme = approvedSchemes.find(s => s.schemeId === plan.schemeId);
                   
@@ -1643,7 +1728,7 @@ const App = () => {
                     <tr key={plan.lpId}>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{plan.class}</td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{plan.subject}</td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{relatedScheme ? relatedScheme.chapter : 'N/A'}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{plan.chapter || 'N/A'}</td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{plan.session}</td>
                       <td className="px-6 py-4 whitespace-nowrap">
                         <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${
@@ -1686,10 +1771,18 @@ const App = () => {
                     </tr>
                   );
                 })}
-                {lessonPlans.length === 0 && (
+                {lessonPlans
+                  .filter(plan => {
+                    return (
+                      (!lessonPlanFilters.class || plan.class === lessonPlanFilters.class) &&
+                      (!lessonPlanFilters.subject || plan.subject === lessonPlanFilters.subject) &&
+                      (!lessonPlanFilters.status || plan.status === lessonPlanFilters.status) &&
+                      (!lessonPlanFilters.chapter || plan.chapter === lessonPlanFilters.chapter)
+                    );
+                  }).length === 0 && (
                   <tr>
                     <td colSpan={6} className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 text-center">
-                      No lesson plans submitted yet.
+                      {lessonPlans.length === 0 ? 'No lesson plans submitted yet.' : 'No lesson plans match the selected filters.'}
                     </td>
                   </tr>
                 )}

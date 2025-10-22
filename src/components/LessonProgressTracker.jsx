@@ -10,6 +10,7 @@ const LessonProgressTracker = ({ user }) => {
   const [selectedClass, setSelectedClass] = useState('');
   const [selectedSubject, setSelectedSubject] = useState('');
   const [selectedTeacher, setSelectedTeacher] = useState('');
+  const [selectedStatus, setSelectedStatus] = useState('');
   const [teachers, setTeachers] = useState([]);
   const [classes, setClasses] = useState([]);
   const [subjects, setSubjects] = useState([]);
@@ -33,7 +34,7 @@ const LessonProgressTracker = ({ user }) => {
         loadFilterOptions();
       }
     }
-  }, [email, selectedClass, selectedSubject, selectedTeacher]);
+  }, [email, selectedClass, selectedSubject, selectedTeacher, selectedStatus]);
 
   const loadFilterOptions = async () => {
     try {
@@ -261,6 +262,17 @@ const LessonProgressTracker = ({ user }) => {
               ))
             )}
           </select>
+          <select
+            value={selectedStatus}
+            onChange={(e) => setSelectedStatus(e.target.value)}
+            className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
+          >
+            <option value="">All Status</option>
+            <option value="Planned">Planned</option>
+            <option value="In Progress">In Progress</option>
+            <option value="Delayed">Delayed</option>
+            <option value="Completed">Completed</option>
+          </select>
           <button
             onClick={loadProgressData}
             className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm"
@@ -445,7 +457,10 @@ const LessonProgressTracker = ({ user }) => {
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
-                {(delays || []).filter(delay => delay && typeof delay === 'object').map((delay, index) => (
+                {(delays || [])
+                  .filter(delay => delay && typeof delay === 'object')
+                  .filter(delay => !selectedStatus || delay.status === selectedStatus)
+                  .map((delay, index) => (
                   <tr key={delay?.progressId || `delay-${index}`} className="hover:bg-gray-50">
                     {isHM() && (
                       <td className="px-6 py-4 whitespace-nowrap">

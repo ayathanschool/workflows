@@ -35,6 +35,69 @@ function _ensureHeaders(sh, cols) {
   }
 }
 
+/**
+ * One-time migration function to add the hasInternalMarks column to existing Exams sheet
+ * Call this function manually in Apps Script editor to update the sheet structure
+ */
+function addHasInternalMarksColumnToExams() {
+  try {
+    const sh = _getSheet('Exams');
+    const headers = _headers(sh);
+    const expectedHeaders = SHEETS.Exams;
+    
+    console.log('Current headers:', headers);
+    console.log('Expected headers:', expectedHeaders);
+    
+    // Check if hasInternalMarks column already exists
+    if (headers.includes('hasInternalMarks')) {
+      console.log('hasInternalMarks column already exists in Exams sheet');
+      return 'hasInternalMarks column already exists';
+    }
+    
+    // Find the position where hasInternalMarks should be inserted (after 'examType')
+    const examTypeIndex = headers.indexOf('examType');
+    const insertIndex = examTypeIndex !== -1 ? examTypeIndex + 1 : headers.length;
+    
+    // Insert the hasInternalMarks column header
+    sh.insertColumnAfter(insertIndex);
+    sh.getRange(1, insertIndex + 1).setValue('hasInternalMarks');
+    
+    console.log(`hasInternalMarks column added at position ${insertIndex + 1}`);
+    
+    // If there are existing rows, populate hasInternalMarks values based on internalMax
+    const lastRow = sh.getLastRow();
+    if (lastRow > 1) {
+      // Get the updated headers after adding the column
+      const newHeaders = _headers(sh);
+      const internalMaxIndex = newHeaders.indexOf('internalMax');
+      const hasInternalMarksIndex = newHeaders.indexOf('hasInternalMarks');
+      
+      // Read all data to determine hasInternalMarks values
+      const dataRange = sh.getRange(2, 1, lastRow - 1, newHeaders.length);
+      const data = dataRange.getValues();
+      
+      // Update each row's hasInternalMarks based on internalMax value
+      const updatedData = data.map(row => {
+        const internalMax = Number(row[internalMaxIndex]) || 0;
+        // If internalMax > 0, then hasInternalMarks should be true
+        row[hasInternalMarksIndex] = internalMax > 0;
+        return row;
+      });
+      
+      // Write the updated data back to the sheet
+      dataRange.setValues(updatedData);
+      
+      console.log(`Updated hasInternalMarks values for ${lastRow - 1} existing rows based on internalMax`);
+    }
+    
+    return `Successfully added hasInternalMarks column to Exams sheet at position ${insertIndex + 1} and populated ${lastRow - 1} rows`;
+    
+  } catch (error) {
+    console.error('Error adding hasInternalMarks column:', error);
+    return `Error adding hasInternalMarks column: ${error.message}`;
+  }
+}
+
 function _rows(sh) {
   const lastRow = sh.getLastRow();
   const lastCol = Math.max(sh.getLastColumn(), 1);
@@ -184,18 +247,71 @@ function jsonResponse(obj) {
 }
 
 /**
- * Calculate grade based on total marks
+ * Calculate grade based on percentage using GradeBoundaries sheet
+ * @param {number} percentage - The percentage score (0-100)
+ * @param {string} className - The class name to determine standard group
+ * @returns {string} - The grade letter (A+, A, B, etc.)
  */
-function _calculateGrade(total) {
-  if (total >= 90) return 'A+';
-  if (total >= 80) return 'A';
-  if (total >= 70) return 'B+';
-  if (total >= 60) return 'B';
-  if (total >= 50) return 'C+';
-  if (total >= 40) return 'C';
-  if (total >= 35) return 'D';
+function _calculateGradeFromBoundaries(percentage, className) {
+  try {
+    const stdGroup = _standardGroup(className);
+    
+    if (!stdGroup) {
+      // Fallback if no standard group can be determined
+      return _calculateGradeFallback(percentage);
+    }
+
+    const gbSh = _getSheet('GradeBoundaries');
+    _ensureHeaders(gbSh, SHEETS.GradeBoundaries);
+    const gbHeaders = _headers(gbSh);
+    
+    const boundaries = _rows(gbSh).map(r => _indexByHeader(r, gbHeaders))
+      .filter(b => {
+        const sheetGroup = String(b.standardGroup || '').trim();
+        // Handle both hyphen and en-dash formats
+        const normalizedSheetGroup = sheetGroup.replace(/[–—−]/g, '-'); // Replace en-dash, em-dash, minus with hyphen
+        const normalizedStdGroup = stdGroup.replace(/[–—−]/g, '-');
+        return normalizedSheetGroup === normalizedStdGroup;
+      })
+      .map(b => ({
+        grade: String(b.grade || ''),
+        minPercentage: Number(b.minPercentage || 0),
+        maxPercentage: Number(b.maxPercentage || 0)
+      }))
+      .sort((a, b) => b.minPercentage - a.minPercentage); // Sort descending
+
+    // Find the appropriate grade boundary
+    for (const boundary of boundaries) {
+      if (percentage >= boundary.minPercentage && percentage <= boundary.maxPercentage) {
+        return boundary.grade;
+      }
+    }
+
+    // If no boundary found, return lowest grade or fallback
+    return boundaries.length > 0 ? boundaries[boundaries.length - 1].grade : _calculateGradeFallback(percentage);
+  } catch (error) {
+    Logger.log('Error calculating grade from boundaries: ' + error);
+    return _calculateGradeFallback(percentage);
+  }
+}
+
+/**
+ * Fallback grade calculation (used when GradeBoundaries is not available)
+ * @param {number} percentage - The percentage score (0-100) 
+ * @returns {string} - The grade letter
+ */
+function _calculateGradeFallback(percentage) {
+  if (percentage >= 90) return 'A+';
+  if (percentage >= 80) return 'A';
+  if (percentage >= 70) return 'B+';
+  if (percentage >= 60) return 'B';
+  if (percentage >= 50) return 'C+';
+  if (percentage >= 40) return 'C';
+  if (percentage >= 35) return 'D';
   return 'F';
 }
+
+
 
 function _respond(obj, status) {
   // Try to use the CORS helper if available
@@ -276,8 +392,8 @@ const SHEETS = {
   //   teacherEmail – email of the teacher submitting marks; teacherName – their name;
   //   admNo – student admission number; studentName – student name;
   //   internal – internal marks scored; external – external marks scored;
-  //   total – computed total marks; createdAt – timestamp of record creation.
-  ExamMarks: ['examId','class','subject','teacherEmail','teacherName','admNo','studentName','internal','external','total','createdAt']
+  //   total – computed total marks; grade – calculated letter grade; createdAt – timestamp of record creation.
+  ExamMarks: ['examId','class','subject','teacherEmail','teacherName','admNo','studentName','internal','external','total','grade','createdAt']
   ,
   // Students: a master list of students with their admission number, name, class
   // assignment and optional contact details.  This sheet is used to populate
@@ -1471,20 +1587,94 @@ function doGet(e) {
     }
 
     if (action === 'getExams') {
-      // Retrieve all exams, optionally filtered by class, subject or examType.
+      // Retrieve all exams, optionally filtered by class, subject or examType and role-based permissions.
       const cls = (e.parameter['class'] || '').trim();
       const subject = (e.parameter.subject || '').trim();
       const examType = (e.parameter.examType || '').trim();
+      
+      // Role-based filtering parameters from frontend
+      const teacherEmail = (e.parameter.teacherEmail || '').toLowerCase().trim();
+      const role = (e.parameter.role || '').toLowerCase().trim();
+      const classTeacherFor = (e.parameter.classTeacherFor || '').trim();
+      const teacherSubjectsStr = (e.parameter.teacherSubjects || '');
+      const teacherSubjects = teacherSubjectsStr ? (Array.isArray(teacherSubjectsStr) ? teacherSubjectsStr : teacherSubjectsStr.split(',').map(s => s.trim()).filter(Boolean)) : [];
+      
       const sh = _getSheet('Exams');
       const headers = _headers(sh);
       const list = _rows(sh).map(r => _indexByHeader(r, headers));
       let filtered = list;
+      
+      // Apply basic filters first
       if (cls) filtered = filtered.filter(ex => String(ex.class||'') === cls);
       if (subject) filtered = filtered.filter(ex => String(ex.subject||'') === subject);
       if (examType) filtered = filtered.filter(ex => String(ex.examType||'') === examType);
+      
+      // Apply role-based filtering if user information is provided
+      if (teacherEmail && role !== 'headmaster') {
+        // Get user information from Users sheet for additional validation
+        const usersSh = _getSheet('Users');
+        const usersHeaders = _headers(usersSh);
+        const users = _rows(usersSh).map(r => _indexByHeader(r, usersHeaders));
+        const currentUser = users.find(u => String(u.email||'').toLowerCase() === teacherEmail);
+        
+        if (currentUser) {
+          // Parse user's classes and subjects
+          const userClassesStr = (currentUser.classes || currentUser.Class || currentUser.Classes || '').toString();
+          const userClasses = userClassesStr ? userClassesStr.split(',').map(s => s.trim()).filter(Boolean) : [];
+          const userSubjectsStr = (currentUser.subjects || currentUser.Subject || currentUser.Subjects || '').toString();
+          const userSubjects = userSubjectsStr ? userSubjectsStr.split(',').map(s => s.trim()).filter(Boolean) : [];
+          const userClassTeacherFor = currentUser.classTeacherFor || currentUser['Class Teacher For'] || '';
+          
+          // Utility function to normalize strings for comparison
+          const normKey = (s) => (s || '').toString().toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
+          
+          // Filter based on role
+          if (role === 'classteacher') {
+            // Class Teacher: can view exams for their class teacher class OR subjects they teach in classes they are assigned to
+            filtered = filtered.filter(ex => {
+              const exClass = normKey(ex.class);
+              const exSubject = normKey(ex.subject);
+              
+              // Access to all subjects in the class they are class teacher for
+              const isClassTeacherForThisClass = userClassTeacherFor && normKey(userClassTeacherFor) === exClass;
+              
+              // Access to subjects they teach, but only in classes they are assigned to
+              const teachesClass = userClasses.some(c => normKey(c) === exClass);
+              const teachesSubject = userSubjects.some(s => normKey(s) === exSubject);
+              const teachesThisSubjectInThisClass = teachesClass && teachesSubject;
+              
+              return isClassTeacherForThisClass || teachesThisSubjectInThisClass;
+            });
+          } else if (role === 'teacher') {
+            // Regular Teacher: can only view exams for classes AND subjects they teach
+            filtered = filtered.filter(ex => {
+              const exClass = normKey(ex.class);
+              const exSubject = normKey(ex.subject);
+              
+              const teachesClass = userClasses.some(c => normKey(c) === exClass);
+              const teachesSubject = userSubjects.some(s => normKey(s) === exSubject);
+              
+              return teachesClass && teachesSubject;
+            });
+          }
+        }
+      }
       const result = filtered.map(ex => {
         // Generate exam name if it doesn't exist in the data (for backward compatibility)
         const examName = ex.examName || `${ex.examType || 'Exam'} - ${ex.class || ''} - ${ex.subject || ''}`;
+        
+        // More comprehensive check for "false" values
+        const isFalseValue = (
+          ex.hasInternalMarks === false ||
+          ex.hasInternalMarks === 'false' ||
+          ex.hasInternalMarks === 'FALSE' ||
+          ex.hasInternalMarks === 'False' ||
+          String(ex.hasInternalMarks).toLowerCase() === 'false' ||
+          ex.hasInternalMarks === 0 ||
+          ex.hasInternalMarks === '0'
+        );
+        
+        const processedHasInternalMarks = !isFalseValue;
         
         return {
           examId: String(ex.examId||''),
@@ -1493,6 +1683,7 @@ function doGet(e) {
           class: String(ex.class||''),
           subject: String(ex.subject||''),
           examType: String(ex.examType||''),
+          hasInternalMarks: processedHasInternalMarks, // Include hasInternalMarks field
           internalMax: Number(ex.internalMax||0),
           externalMax: Number(ex.externalMax||0),
           totalMax: Number(ex.totalMax||0),
@@ -1519,33 +1710,18 @@ function doGet(e) {
       const examTotalMax = exam && exam.totalMax ? Number(exam.totalMax) : 0;
       const examClass = exam && exam.class ? String(exam.class) : '';
       const stdGroup = _standardGroup(examClass);
-      // Load grade boundaries for this group
-      let boundaries = [];
-      if (stdGroup) {
-        const gbSh = _getSheet('GradeBoundaries');
-        _ensureHeaders(gbSh, SHEETS.GradeBoundaries);
-        const gbHeaders = _headers(gbSh);
-        boundaries = _rows(gbSh).map(r => _indexByHeader(r, gbHeaders))
-          .filter(b => String(b.standardGroup||'') === stdGroup)
-          .map(b => ({
-            grade: String(b.grade||''),
-            minPercentage: Number(b.minPercentage||0),
-            maxPercentage: Number(b.maxPercentage||0)
-          }))
-          .sort((a,b) => a.minPercentage - b.minPercentage);
-      }
       const list = _rows(sh).map(r => _indexByHeader(r, headers))
         .filter(m => String(m.examId||'') === examId)
         .map(m => {
           const internal = Number(m.internal||0);
           const external = Number(m.external||0);
           const total = Number(m.total|| (internal + external));
-          // Compute percentage and grade if exam metadata is available
+          // Compute percentage and grade using our unified function
           let grade = '';
-          if (examTotalMax > 0 && boundaries.length > 0) {
-            const perc = (total / examTotalMax) * 100;
-            const b = boundaries.find(gb => perc >= gb.minPercentage && perc <= gb.maxPercentage);
-            grade = b ? b.grade : '';
+          let percentage = 0;
+          if (examTotalMax > 0 && total > 0) {
+            percentage = Math.round((total / examTotalMax) * 100);
+            grade = _calculateGradeFromBoundaries(percentage, examClass);
           }
           return {
             admNo: String(m.admNo||''),
@@ -1553,6 +1729,7 @@ function doGet(e) {
             internal: internal,
             external: external,
             total: total,
+            percentage: percentage, // Add percentage field
             teacherName: String(m.teacherName||''),
             grade: grade
           };
@@ -1990,6 +2167,34 @@ function doGet(e) {
       } catch (err) {
         return _respond({ error: String(err.message || err) });
       }
+    }
+
+    if (action === 'debugHasInternalMarks') {
+      // Debug endpoint to check hasInternalMarks values in the sheet
+      const sh = _getSheet('Exams');
+      const headers = _headers(sh);
+      const rows = _rows(sh);
+      const hasInternalMarksIdx = headers.indexOf('hasInternalMarks');
+      
+      const debugData = rows.slice(0, 5).map((row, index) => {
+        const rawValue = hasInternalMarksIdx >= 0 ? row[hasInternalMarksIdx] : 'NOT_FOUND';
+        return {
+          rowIndex: index + 2, // +2 because row 1 is headers and array is 0-indexed
+          examId: row[headers.indexOf('examId')] || 'NO_EXAM_ID',
+          class: row[headers.indexOf('class')] || 'NO_CLASS',
+          subject: row[headers.indexOf('subject')] || 'NO_SUBJECT',
+          rawHasInternalMarks: rawValue,
+          typeOfRawValue: typeof rawValue,
+          stringValue: String(rawValue),
+          booleanValue: Boolean(rawValue)
+        };
+      });
+      
+      return _respond({ 
+        headers: headers,
+        hasInternalMarksColumnIndex: hasInternalMarksIdx,
+        sampleRows: debugData 
+      });
     }
 
     return _respond({ error: 'Unknown action' });
@@ -2567,6 +2772,70 @@ function doPost(e) {
     if (action === 'createExam') {
       // Create a new exam.  The payload should include email, creatorName,
       // class, subject, examType, hasInternalMarks, internalMax, externalMax, totalMax and date.
+      
+      // Check permission before creating exam
+      const creatorEmail = (data.email||'').toLowerCase().trim();
+      const examClass = data.class || '';
+      const examSubject = data.subject || '';
+      
+      if (!creatorEmail) {
+        return _respond({ error: 'Creator email is required' });
+      }
+      
+      // Get user information from Users sheet to validate permissions
+      const usersSh = _getSheet('Users');
+      const usersHeaders = _headers(usersSh);
+      const users = _rows(usersSh).map(r => _indexByHeader(r, usersHeaders));
+      const currentUser = users.find(u => String(u.email||'').toLowerCase() === creatorEmail);
+      
+      if (!currentUser) {
+        return _respond({ error: 'User not found or not authorized' });
+      }
+      
+      // Parse user's role, classes and subjects
+      const roleStr = (currentUser.roles || currentUser.role || '').toString().toLowerCase();
+      const userClassesStr = (currentUser.classes || currentUser.Class || currentUser.Classes || '').toString();
+      const userClasses = userClassesStr ? userClassesStr.split(',').map(s => s.trim()).filter(Boolean) : [];
+      const userSubjectsStr = (currentUser.subjects || currentUser.Subject || currentUser.Subjects || '').toString();
+      const userSubjects = userSubjectsStr ? userSubjectsStr.split(',').map(s => s.trim()).filter(Boolean) : [];
+      const userClassTeacherFor = currentUser.classTeacherFor || currentUser['Class Teacher For'] || '';
+      
+      // Utility function to normalize strings for comparison
+      const normKey = (s) => (s || '').toString().toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
+      
+      // Check permissions based on role
+      const isHeadmaster = roleStr.includes('h m') || roleStr === 'hm' || roleStr.includes('headmaster');
+      const isClassTeacher = roleStr.includes('class teacher') || roleStr === 'classteacher';
+      
+      let hasPermission = false;
+      
+      if (isHeadmaster) {
+        // HM can create exams for any class and subject
+        hasPermission = true;
+      } else if (isClassTeacher) {
+        // Class Teacher can create exams for their class teacher class OR any subject they teach
+        const exClass = normKey(examClass);
+        const exSubject = normKey(examSubject);
+        
+        const isClassTeacherForThisClass = userClassTeacherFor && normKey(userClassTeacherFor) === exClass;
+        const teachesThisSubject = userSubjects.some(s => normKey(s) === exSubject);
+        
+        hasPermission = isClassTeacherForThisClass || teachesThisSubject;
+      } else {
+        // Regular Teacher: can only create exams for classes AND subjects they teach
+        const exClass = normKey(examClass);
+        const exSubject = normKey(examSubject);
+        
+        const teachesClass = userClasses.some(c => normKey(c) === exClass);
+        const teachesSubject = userSubjects.some(s => normKey(s) === exSubject);
+        
+        hasPermission = teachesClass && teachesSubject;
+      }
+      
+      if (!hasPermission) {
+        return _respond({ error: 'You do not have permission to create an exam for this class and subject' });
+      }
+      
       const sh = _getSheet('Exams');
       _ensureHeaders(sh, SHEETS.Exams);
       const now = new Date().toISOString();
@@ -2634,6 +2903,7 @@ function doPost(e) {
               '', // internal
               '', // external
               '', // total
+              '', // grade (empty until marks are submitted)
               createdAt
             ]);
           });
@@ -2761,6 +3031,7 @@ function doPost(e) {
                 '', // internal
                 '', // external
                 '', // total
+                '', // grade (empty until marks are submitted)
                 createdAt
               ]);
             });
@@ -2783,12 +3054,15 @@ function doPost(e) {
 
     if (action === 'updateExam') {
       // Update an existing exam. Payload should contain examId and updated fields.
-      // Only headmasters should be allowed to update exams.
       try {
         const { examId, userEmail, class: cls, subject, examType, hasInternalMarks, internalMax, externalMax, totalMax, date } = data;
         
         if (!examId) {
           return _respond({ error: 'Missing examId' });
+        }
+        
+        if (!userEmail) {
+          return _respond({ error: 'User email is required' });
         }
         
         const sh = _getSheet('Exams');
@@ -2811,6 +3085,82 @@ function doPost(e) {
         
         const values = sh.getRange(2, 1, last - 1, headers.length).getValues();
         
+        // Find the exam first to check current class/subject for permission validation
+        let examToUpdate = null;
+        let examRowIndex = -1;
+        for (let i = 0; i < values.length; i++) {
+          if (String(values[i][examIdIdx]) === String(examId)) {
+            examToUpdate = {
+              examId: values[i][examIdIdx],
+              class: values[i][classIdx],
+              subject: values[i][subjectIdx]
+            };
+            examRowIndex = i;
+            break;
+          }
+        }
+        
+        if (!examToUpdate) {
+          return _respond({ error: 'Exam not found' });
+        }
+        
+        // Check permission before updating exam
+        const editorEmail = userEmail.toLowerCase().trim();
+        
+        // Get user information from Users sheet to validate permissions
+        const usersSh = _getSheet('Users');
+        const usersHeaders = _headers(usersSh);
+        const users = _rows(usersSh).map(r => _indexByHeader(r, usersHeaders));
+        const currentUser = users.find(u => String(u.email||'').toLowerCase() === editorEmail);
+        
+        if (!currentUser) {
+          return _respond({ error: 'User not found or not authorized' });
+        }
+        
+        // Parse user's role, classes and subjects
+        const roleStr = (currentUser.roles || currentUser.role || '').toString().toLowerCase();
+        const userClassesStr = (currentUser.classes || currentUser.Class || currentUser.Classes || '').toString();
+        const userClasses = userClassesStr ? userClassesStr.split(',').map(s => s.trim()).filter(Boolean) : [];
+        const userSubjectsStr = (currentUser.subjects || currentUser.Subject || currentUser.Subjects || '').toString();
+        const userSubjects = userSubjectsStr ? userSubjectsStr.split(',').map(s => s.trim()).filter(Boolean) : [];
+        const userClassTeacherFor = currentUser.classTeacherFor || currentUser['Class Teacher For'] || '';
+        
+        // Utility function to normalize strings for comparison
+        const normKey = (s) => (s || '').toString().toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
+        
+        // Check permissions based on role - use current exam class/subject for permission check
+        const isHeadmaster = roleStr.includes('h m') || roleStr === 'hm' || roleStr.includes('headmaster');
+        const isClassTeacher = roleStr.includes('class teacher') || roleStr === 'classteacher';
+        
+        let hasPermission = false;
+        
+        if (isHeadmaster) {
+          // HM can update any exam
+          hasPermission = true;
+        } else if (isClassTeacher) {
+          // Class Teacher can update exams for their class teacher class OR any subject they teach
+          const exClass = normKey(examToUpdate.class);
+          const exSubject = normKey(examToUpdate.subject);
+          
+          const isClassTeacherForThisClass = userClassTeacherFor && normKey(userClassTeacherFor) === exClass;
+          const teachesThisSubject = userSubjects.some(s => normKey(s) === exSubject);
+          
+          hasPermission = isClassTeacherForThisClass || teachesThisSubject;
+        } else {
+          // Regular Teacher: can only update exams for classes AND subjects they teach
+          const exClass = normKey(examToUpdate.class);
+          const exSubject = normKey(examToUpdate.subject);
+          
+          const teachesClass = userClasses.some(c => normKey(c) === exClass);
+          const teachesSubject = userSubjects.some(s => normKey(s) === exSubject);
+          
+          hasPermission = teachesClass && teachesSubject;
+        }
+        
+        if (!hasPermission) {
+          return _respond({ error: 'You do not have permission to update this exam' });
+        }
+        
         // Normalize date to ISO format (YYYY-MM-DD)
         let examDate = '';
         if (date) {
@@ -2828,76 +3178,69 @@ function doPost(e) {
           }
         }
         
-        // Find the exam row to update
-        for (let i = 0; i < values.length; i++) {
-          if (String(values[i][examIdIdx]) === String(examId)) {
-            // Update the exam properties
-            if (cls) values[i][classIdx] = cls;
-            if (subject) values[i][subjectIdx] = subject;
-            if (examType) values[i][examTypeIdx] = examType;
-            if (hasInternalMarks !== undefined) values[i][hasInternalMarksIdx] = Boolean(hasInternalMarks);
-            if (internalMax !== undefined) values[i][internalMaxIdx] = Number(internalMax);
-            if (externalMax !== undefined) values[i][externalMaxIdx] = Number(externalMax);
-            if (totalMax !== undefined) values[i][totalMaxIdx] = Number(totalMax);
-            if (examDate) values[i][dateIdx] = examDate;
-            
-            // Update exam name to follow the format: "ExamType - Class - Subject"
-            const newExamType = examType || String(values[i][examTypeIdx]) || 'Exam';
-            const newClass = cls || String(values[i][classIdx]) || '';
-            const newSubject = subject || String(values[i][subjectIdx]) || '';
-            const newExamName = `${newExamType} - ${newClass} - ${newSubject}`;
-            
-            if (examNameIdx !== -1) {
-              values[i][examNameIdx] = newExamName;
-            }
-            
-            // Update the row in the sheet
-            sh.getRange(2 + i, 1, 1, headers.length).setValues([values[i]]);
-            
-            // Also update class and subject in ExamMarks if they've changed
-            if (cls || subject) {
-              const originalClass = String(values[i][classIdx]);
-              const originalSubject = String(values[i][subjectIdx]);
+        // Update the exam properties using the found row index
+        if (cls) values[examRowIndex][classIdx] = cls;
+        if (subject) values[examRowIndex][subjectIdx] = subject;
+        if (examType) values[examRowIndex][examTypeIdx] = examType;
+        if (hasInternalMarks !== undefined) values[examRowIndex][hasInternalMarksIdx] = Boolean(hasInternalMarks);
+        if (internalMax !== undefined) values[examRowIndex][internalMaxIdx] = Number(internalMax);
+        if (externalMax !== undefined) values[examRowIndex][externalMaxIdx] = Number(externalMax);
+        if (totalMax !== undefined) values[examRowIndex][totalMaxIdx] = Number(totalMax);
+        if (examDate) values[examRowIndex][dateIdx] = examDate;
+        
+        // Update exam name to follow the format: "ExamType - Class - Subject"
+        const newExamType = examType || String(values[examRowIndex][examTypeIdx]) || 'Exam';
+        const newClass = cls || String(values[examRowIndex][classIdx]) || '';
+        const newSubject = subject || String(values[examRowIndex][subjectIdx]) || '';
+        const newExamName = `${newExamType} - ${newClass} - ${newSubject}`;
+        
+        if (examNameIdx !== -1) {
+          values[examRowIndex][examNameIdx] = newExamName;
+        }
+        
+        // Update the row in the sheet
+        sh.getRange(2 + examRowIndex, 1, 1, headers.length).setValues([values[examRowIndex]]);
+        
+        // Also update class and subject in ExamMarks if they've changed
+        if (cls || subject) {
+          const originalClass = String(values[examRowIndex][classIdx]);
+          const originalSubject = String(values[examRowIndex][subjectIdx]);
+          
+          if (cls !== originalClass || subject !== originalSubject) {
+            try {
+              const emSh = _getSheet('ExamMarks');
+              const emHeaders = _headers(emSh);
+              const emExamIdIdx = emHeaders.indexOf('examId');
+              const emClassIdx = emHeaders.indexOf('class');
+              const emSubjectIdx = emHeaders.indexOf('subject');
               
-              if (cls !== originalClass || subject !== originalSubject) {
-                try {
-                  const emSh = _getSheet('ExamMarks');
-                  const emHeaders = _headers(emSh);
-                  const emExamIdIdx = emHeaders.indexOf('examId');
-                  const emClassIdx = emHeaders.indexOf('class');
-                  const emSubjectIdx = emHeaders.indexOf('subject');
-                  
-                  const emLast = emSh.getLastRow();
-                  if (emLast >= 2) {
-                    const emValues = emSh.getRange(2, 1, emLast - 1, emHeaders.length).getValues();
-                    let hasUpdates = false;
-                    
-                    for (let j = 0; j < emValues.length; j++) {
-                      if (String(emValues[j][emExamIdIdx]) === String(examId)) {
-                        // Update class and subject if they've changed
-                        if (cls && cls !== originalClass) emValues[j][emClassIdx] = cls;
-                        if (subject && subject !== originalSubject) emValues[j][emSubjectIdx] = subject;
-                        hasUpdates = true;
-                      }
-                    }
-                    
-                    // Write back updates if any were made
-                    if (hasUpdates) {
-                      emSh.getRange(2, 1, emValues.length, emHeaders.length).setValues(emValues);
-                    }
+              const emLast = emSh.getLastRow();
+              if (emLast >= 2) {
+                const emValues = emSh.getRange(2, 1, emLast - 1, emHeaders.length).getValues();
+                let hasUpdates = false;
+                
+                for (let j = 0; j < emValues.length; j++) {
+                  if (String(emValues[j][emExamIdIdx]) === String(examId)) {
+                    // Update class and subject if they've changed
+                    if (cls && cls !== originalClass) emValues[j][emClassIdx] = cls;
+                    if (subject && subject !== originalSubject) emValues[j][emSubjectIdx] = subject;
+                    hasUpdates = true;
                   }
-                } catch (err) {
-                  console.error('Failed to update ExamMarks:', err);
-                  // Non-fatal error, continue with success response
+                }
+                
+                // Write back updates if any were made
+                if (hasUpdates) {
+                  emSh.getRange(2, 1, emValues.length, emHeaders.length).setValues(emValues);
                 }
               }
+            } catch (err) {
+              console.error('Failed to update ExamMarks:', err);
+              // Non-fatal error, continue with success response
             }
-            
-            return _respond({ updated: true });
           }
         }
         
-        return _respond({ error: 'Exam not found' });
+        return _respond({ updated: true });
       } catch (err) {
         console.error('Error updating exam:', err);
         return _respond({ error: 'Failed to update exam: ' + (err.message || String(err)) });
@@ -2997,6 +3340,7 @@ function doPost(e) {
       const internalIdx = headers.indexOf('internal');
       const externalIdx = headers.indexOf('external');
       const totalIdx = headers.indexOf('total');
+      const gradeIdx = headers.indexOf('grade');
       const teacherEmailIdx = headers.indexOf('teacherEmail');
       const teacherNameIdx = headers.indexOf('teacherName');
       const createdAtIdx = headers.indexOf('createdAt');
@@ -3008,6 +3352,13 @@ function doPost(e) {
         const internal = hasInternalMarks ? Number(m.internal || 0) : 0; // Set to 0 if exam has no internal marks
         const external = Number(m.external || 0);
         const total = internal + external;
+        
+        // Calculate grade using the exam's total max marks and class
+        let grade = '';
+        if (exam && exam.totalMax && total > 0) {
+          const percentage = (total / Number(exam.totalMax)) * 100;
+          grade = _calculateGradeFromBoundaries(percentage, exam.class || cls);
+        }
 
         let found = -1;
         for (let i = 0; i < values.length; i++) {
@@ -3037,6 +3388,7 @@ function doPost(e) {
           values[found][internalIdx] = internal;
           values[found][externalIdx] = external;
           values[found][totalIdx] = total;
+          if (gradeIdx >= 0) values[found][gradeIdx] = grade;
           if (teacherEmailIdx >= 0) values[found][teacherEmailIdx] = teacherEmail;
           if (teacherNameIdx >= 0) values[found][teacherNameIdx] = teacherName;
           if (createdAtIdx >= 0) values[found][createdAtIdx] = now;
@@ -3053,6 +3405,7 @@ function doPost(e) {
             internal,
             external,
             total,
+            grade,
             now
           ]);
         }
@@ -3107,6 +3460,19 @@ function doPost(e) {
       }
       
       try {
+        // First, get exam metadata to understand total max marks
+        const examSh = _getSheet('Exams');
+        const examHeaders = _headers(examSh);
+        const examData = _rows(examSh).map(r => _indexByHeader(r, examHeaders));
+        const exam = examData.find(ex => String(ex.examId || '') === String(examId));
+        
+        if (!exam) {
+          return _respond({ error: 'Exam not found' });
+        }
+        
+        const examTotalMax = Number(exam.totalMax || 0);
+        const examClass = String(exam.class || '');
+        
         const marksSh = _getSheet('ExamMarks');
         const marksHeaders = _headers(marksSh);
         const marksData = _rows(marksSh).map(r => _indexByHeader(r, marksHeaders));
@@ -3149,11 +3515,25 @@ function doPost(e) {
             };
           }
           
+          // Use stored grade if available, otherwise calculate it
+          let grade = String(mark.grade || '').trim();
+          if (!grade || grade === 'N/A') {
+            // Calculate grade using GradeBoundaries as fallback
+            if (examTotalMax > 0 && total > 0) {
+              const percentage = (total / examTotalMax) * 100;
+              // Use the class from the exam or from the mark record
+              const gradeClass = examClass || String(mark.class || '');
+              grade = _calculateGradeFromBoundaries(percentage, gradeClass);
+            } else {
+              grade = 'N/A';
+            }
+          }
+          
           studentMap[studentAdm].subjects[subject] = {
             internal: internal,
             external: external,
             total: total,
-            grade: _calculateGrade(total)
+            grade: grade
           };
         });
         
@@ -3435,6 +3815,42 @@ function doPost(e) {
       return _respond(debugExamMarks());
     }
 
+    if (action === 'addGradeColumn') {
+      return _respond({ result: addGradeColumnToExamMarks() });
+    }
+
+    if (action === 'addHasInternalMarksColumn') {
+      return _respond({ result: addHasInternalMarksColumnToExams() });
+    }
+
+    if (action === 'debugHasInternalMarks') {
+      // Debug endpoint to check hasInternalMarks values in the sheet
+      const sh = _getSheet('Exams');
+      const headers = _headers(sh);
+      const rows = _rows(sh);
+      const hasInternalMarksIdx = headers.indexOf('hasInternalMarks');
+      
+      const debugData = rows.slice(0, 5).map((row, index) => {
+        const rawValue = hasInternalMarksIdx >= 0 ? row[hasInternalMarksIdx] : 'NOT_FOUND';
+        return {
+          rowIndex: index + 2, // +2 because row 1 is headers and array is 0-indexed
+          examId: row[headers.indexOf('examId')] || 'NO_EXAM_ID',
+          class: row[headers.indexOf('class')] || 'NO_CLASS',
+          subject: row[headers.indexOf('subject')] || 'NO_SUBJECT',
+          rawHasInternalMarks: rawValue,
+          typeOfRawValue: typeof rawValue,
+          stringValue: String(rawValue),
+          booleanValue: Boolean(rawValue)
+        };
+      });
+      
+      return _respond({ 
+        headers: headers,
+        hasInternalMarksColumnIndex: hasInternalMarksIdx,
+        sampleRows: debugData 
+      });
+    }
+
     return _respond({ error: 'Unknown action' });
   } catch (err) {
     return _respond({ error: String(err && err.message ? err.message : err) });
@@ -3442,8 +3858,71 @@ function doPost(e) {
 }
 
 /**
+ * Create test users for development/testing
+ * Call this function once to set up initial users
+ */
+function createTestUsers() {
+  const sh = _getSheet('Users');
+  _ensureHeaders(sh, SHEETS.Users);
+  
+  // Check if test users already exist
+  const headers = _headers(sh);
+  const existingUsers = _rows(sh).map(r => _indexByHeader(r, headers));
+  
+  const testUsers = [
+    {
+      email: 'test@test.com',
+      name: 'Test User',
+      roles: 'h m',
+      classes: '10A,10B',
+      subjects: 'Math,Science',
+      classTeacherFor: '10A',
+      password: '' // No password for easy testing
+    },
+    {
+      email: 'teacher@test.com', 
+      name: 'Test Teacher',
+      roles: 'teacher',
+      classes: '9A,9B',
+      subjects: 'English,History',
+      classTeacherFor: '9A',
+      password: ''
+    }
+  ];
+  
+  testUsers.forEach(user => {
+    const exists = existingUsers.find(u => String(u.email || '').toLowerCase() === user.email.toLowerCase());
+    if (!exists) {
+      sh.appendRow([
+        user.email,
+        user.name,
+        user.roles,
+        user.classes,
+        user.subjects,
+        user.classTeacherFor,
+        user.password
+      ]);
+      Logger.log(`Created test user: ${user.email}`);
+    } else {
+      Logger.log(`Test user already exists: ${user.email}`);
+    }
+  });
+  
+  Logger.log('Test users setup complete');
+}
+
+/**
  * TEST FUNCTIONS - Use these in Apps Script editor to verify functionality
  */
+
+/**
+ * Test function to add hasInternalMarks column - run this in Apps Script editor
+ */
+function testAddHasInternalMarksColumn() {
+  const result = addHasInternalMarksColumnToExams();
+  console.log('Migration result:', result);
+  return result;
+}
 
 /**
  * Test the substitution workflow manually

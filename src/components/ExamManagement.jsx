@@ -4,6 +4,23 @@ import * as api from '../api';
 import { todayIST, parseApiDate, formatShortDate } from '../utils/dateUtils';
 
 const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) => {
+  // Helper function to determine if exam has internal marks
+  const examHasInternalMarks = (exam) => {
+    if (!exam) return false;
+    
+    const isFalseValue = (
+      exam.hasInternalMarks === false ||
+      exam.hasInternalMarks === 'false' ||
+      exam.hasInternalMarks === 'FALSE' ||
+      exam.hasInternalMarks === 'False' ||
+      String(exam.hasInternalMarks).toLowerCase() === 'false' ||
+      exam.hasInternalMarks === 0 ||
+      exam.hasInternalMarks === '0'
+    );
+    
+    return !isFalseValue;
+  };
+  
   // Normalize user roles internally if userRolesNorm isn't provided
   const normalizedRoles = useMemo(() => {
     if (Array.isArray(userRolesNorm)) return userRolesNorm;
@@ -98,9 +115,8 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
       try {
         setIsLoading(true);
         setApiError('');
-        // Fetch all exams
-        const examList = await api.getExams();
-        setExams(Array.isArray(examList) ? examList : []);
+        // Fetch all exams with proper role-based filtering
+        await reloadExams();
         // Fetch classes for HM or use teacher's classes
         if (user) {
           // Check if hasRole is a function before calling it
@@ -130,10 +146,8 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
     async function fetchAllSubjects() {
       try {
         setSubjectsLoading(true);
-        console.log('🔍 Fetching subjects...');
         // Get all available subjects from the centralized API endpoint
         const allSubjects = await api.getSubjects();
-        console.log('📝 All subjects from API:', allSubjects);
         
         // Check if hasRole is a function before calling it
         const isHeadmaster = typeof hasRole === 'function' ? 
@@ -142,8 +156,6 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
         
         // Check if user is a class teacher
         const isClassTeacher = normalizedRoles.some(r => r.includes('class teacher') || r === 'classteacher');
-        
-        console.log('👤 User roles:', { isHeadmaster, isClassTeacher, normalizedRoles });
         
         // Filter subjects based on user role and selected class
         if (user && !isHeadmaster) {
@@ -418,9 +430,8 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
       setToast({ type: 'success', text: 'Exam created successfully' });
       setTimeout(() => setToast(null), 3000);
       
-      // Refresh exams list
-      const examList = await api.getExams();
-      setExams(Array.isArray(examList) ? examList : []);
+      // Refresh exams list with proper role-based filtering
+      await reloadExams();
       
       // Close form and reset
       setShowExamForm(false);
@@ -656,16 +667,16 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
     
     // If user is a Class Teacher, allow access to:
     // 1. Any subject from the class they are class teacher for
-    // 2. OR any subject they teach regardless of class
+    // 2. OR subjects they teach but only in classes they are assigned to teach
     const isClassTeacher = normalizedRoles.some(r => r.includes('class teacher') || r === 'classteacher');
     if (isClassTeacher) {
       // Access to all subjects in the class they are class teacher for
       const isClassTeacherForThisClass = user.classTeacherFor && normKey(user.classTeacherFor) === exClass;
       
-      // Access to any subject they teach (in any class)
-      const teachesThisSubject = teachesSubject;
+      // Access to subjects they teach, but only in classes they are assigned to
+      const teachesThisSubjectInThisClass = teachesSubject && teachesClass;
       
-      return isClassTeacherForThisClass || teachesThisSubject;
+      return isClassTeacherForThisClass || teachesThisSubjectInThisClass;
     }
     
     // Regular subject teacher: require both class and subject match.
@@ -674,13 +685,6 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
 
   // Open marks form for a specific exam
   const openMarksForm = async (exam) => {
-    // Debug the exam object
-    console.log('DEBUG: Opening marks form for exam:', exam);
-    console.log('DEBUG: hasInternalMarks =', exam.hasInternalMarks);
-    console.log('DEBUG: hasInternalMarks type =', typeof exam.hasInternalMarks);
-    console.log('DEBUG: internalMax =', exam.internalMax);
-    console.log('DEBUG: internalMax type =', typeof exam.internalMax);
-    
     setSelectedExam(exam);
     setIsLoading(true);
     setApiError('');
@@ -733,7 +737,7 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
       class: exam.class,
       subject: exam.subject,
       examType: exam.examType,
-      hasInternalMarks: exam.hasInternalMarks === true || String(exam.hasInternalMarks).toLowerCase() === 'true',
+      hasInternalMarks: examHasInternalMarks(exam),
       internalMax: Number(exam.internalMax || 0),
       externalMax: Number(exam.externalMax || 0),
       date: parseApiDate(exam.date) // Ensure we have a normalized date format
@@ -1415,10 +1419,10 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
             <div className="mb-4 flex justify-between items-center">
               <div className="text-sm text-gray-600">
                 <span className="font-medium">Max Marks:</span> {selectedExam.totalMax} 
-                {selectedExam.hasInternalMarks !== false && (
+                {examHasInternalMarks(selectedExam) && (
                   <span>(Internal: {selectedExam.internalMax || 0}, External: {selectedExam.externalMax || 0})</span>
                 )}
-                {selectedExam.hasInternalMarks === false && (
+                {!examHasInternalMarks(selectedExam) && (
                   <span>(External only: {selectedExam.externalMax || 0})</span>
                 )}
               </div>
@@ -1445,8 +1449,10 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
                     <tr>
                       <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Adm. No</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Student Name</th>
-                      {/* Always show internal marks column since hasInternalMarks defaults to true in backend */}
-                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Internal ({selectedExam.internalMax || 0})</th>
+                      {/* Only show internal marks column if exam has internal marks */}
+                      {examHasInternalMarks(selectedExam) && (
+                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Internal ({selectedExam.internalMax || 0})</th>
+                      )}
                       <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">External ({selectedExam.externalMax || 0})</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">%</th>
@@ -1458,17 +1464,19 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
                       <tr key={row.admNo} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
                         <td className="px-4 py-2 whitespace-nowrap text-sm">{row.admNo}</td>
                         <td className="px-4 py-2 whitespace-nowrap text-sm">{row.studentName}</td>
-                        {/* Always show internal marks input since hasInternalMarks defaults to true in backend */}
-                        <td className="px-4 py-2 whitespace-nowrap">
-                          <input 
-                            type="number" 
-                            min="0" 
-                            max={selectedExam.internalMax || 0} 
-                            value={row.internal} 
-                            onChange={(e) => handleMarksChange(index, 'internal', e.target.value)}
-                            className="w-16 px-2 py-1 border border-gray-300 rounded-md"
-                          />
-                        </td>
+                        {/* Only show internal marks input if exam has internal marks */}
+                        {examHasInternalMarks(selectedExam) && (
+                          <td className="px-4 py-2 whitespace-nowrap">
+                            <input 
+                              type="number" 
+                              min="0" 
+                              max={selectedExam.internalMax || 0} 
+                              value={row.internal} 
+                              onChange={(e) => handleMarksChange(index, 'internal', e.target.value)}
+                              className="w-16 px-2 py-1 border border-gray-300 rounded-md"
+                            />
+                          </td>
+                        )}
                         <td className="px-4 py-2 whitespace-nowrap">
                           <input 
                             type="number" 
@@ -1648,10 +1656,10 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
             <div className="mb-4">
               <div className="text-sm text-gray-600">
                 <span className="font-medium">Max Marks:</span> {viewExamMarks.totalMax} 
-                {viewExamMarks.hasInternalMarks !== false && (
+                {examHasInternalMarks(viewExamMarks) && (
                   <span>(Internal: {viewExamMarks.internalMax || 0}, External: {viewExamMarks.externalMax || 0})</span>
                 )}
-                {viewExamMarks.hasInternalMarks === false && (
+                {!examHasInternalMarks(viewExamMarks) && (
                   <span>(External only: {viewExamMarks.externalMax || 0})</span>
                 )}
               </div>
@@ -1669,8 +1677,9 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
                     <tr>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Adm No</th>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Student Name</th>
-                      {/* Always show internal column since hasInternalMarks defaults to true in backend */}
-                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Internal</th>
+                      {examHasInternalMarks(viewExamMarks) && (
+                        <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Internal</th>
+                      )}
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">External</th>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Total</th>
                       <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Percentage</th>
@@ -1682,11 +1691,15 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
                       <tr key={row.admNo} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
                         <td className="px-4 py-2 whitespace-nowrap text-sm">{row.admNo}</td>
                         <td className="px-4 py-2 whitespace-nowrap text-sm">{row.studentName}</td>
-                        {/* Always show internal marks since hasInternalMarks defaults to true in backend */}
-                        <td className="px-4 py-2 whitespace-nowrap text-sm">{row.internal || '-'}</td>
+                        {examHasInternalMarks(viewExamMarks) && (
+                          <td className="px-4 py-2 whitespace-nowrap text-sm">{row.internal || '-'}</td>
+                        )}
                         <td className="px-4 py-2 whitespace-nowrap text-sm">{row.external || '-'}</td>
                         <td className="px-4 py-2 whitespace-nowrap text-sm">{row.total || '-'}</td>
-                        <td className="px-4 py-2 whitespace-nowrap text-sm">{row.percentage ? row.percentage + '%' : '-'}</td>
+                        <td className="px-4 py-2 whitespace-nowrap text-sm">
+                          {row.percentage ? row.percentage + '%' : 
+                           (row.total && viewExamMarks.totalMax ? Math.round((row.total / viewExamMarks.totalMax) * 100) + '%' : '-')}
+                        </td>
                         <td className="px-4 py-2 whitespace-nowrap text-sm">{row.grade || '-'}</td>
                       </tr>
                     ))}
@@ -1708,10 +1721,12 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
   
   // Helper function to calculate total marks
   function calculateTotal(row, exam = selectedExam) {
-    // Always include internal marks since hasInternalMarks defaults to true in backend
-    const internal = Number(row.internal) || 0;
     const external = Number(row.external) || 0;
-    return internal + external;
+    if (examHasInternalMarks(exam)) {
+      const internal = Number(row.internal) || 0;
+      return internal + external;
+    }
+    return external;
   }
   
   // Helper function to calculate percentage
