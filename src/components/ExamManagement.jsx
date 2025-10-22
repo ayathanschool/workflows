@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { Plus, Bell, Search, Filter, RefreshCw, Loader } from 'lucide-react';
 import * as api from '../api';
 import { todayIST, parseApiDate, formatShortDate } from '../utils/dateUtils';
@@ -89,6 +89,10 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
 
   const [viewExamMarks, setViewExamMarks] = useState(null);
   const [examMarks, setExamMarks] = useState([]);
+  
+  // Performance optimization: Cache frequently accessed data
+  const [studentsCache, setStudentsCache] = useState(new Map());
+  const [marksCache, setMarksCache] = useState(new Map());
   
   // State for editing exams
   const [showEditExamForm, setShowEditExamForm] = useState(false);
@@ -205,18 +209,15 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
             
             // Convert the set back to an array and sort it
             const filteredSubjects = Array.from(subjectsSet).filter(Boolean).sort();
-            console.log('🎓 Class teacher subjects:', filteredSubjects);
             setAvailableSubjects(filteredSubjects);
           } else {
             // Regular teacher: just show their subjects
             const teacherSubjects = Array.isArray(user.subjects) ? user.subjects : [];
-            console.log('👨‍🏫 Regular teacher subjects:', teacherSubjects);
             setAvailableSubjects(teacherSubjects);
           }
         } else {
           // Headmaster: filter subjects based on selected class
           const selectedClass = (examFormData.class || '').toString().trim();
-          console.log('🏫 Headmaster - selected class:', selectedClass);
           
           if (selectedClass) {
             // Show only subjects for the selected class
@@ -259,7 +260,6 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
     
     // Fallback method to use exam-based subjects if API fails
     function fallbackToExamBasedSubjects() {
-      console.log('🔄 Using fallback method for subjects');
       const cls = (examFormData.class || '').toString().trim();
       
       // Check if hasRole is a function before calling it
@@ -296,7 +296,6 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
         }
         
         const list = Array.from(subjectsSet).filter(Boolean).sort();
-        console.log('🔄 Fallback class teacher subjects:', list);
         setAvailableSubjects(list);
         return;
       }
@@ -304,7 +303,6 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
       // If user is a regular teacher (not class teacher, not HM), restrict to their subjects
       if (user && !isHeadmaster) {
         const teacherSubjects = Array.isArray(user.subjects) ? user.subjects : [];
-        console.log('🔄 Fallback regular teacher subjects:', teacherSubjects);
         setAvailableSubjects(teacherSubjects);
         return;
       }
@@ -335,7 +333,6 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
       }
       
       const list = Array.from(subjectsSet).filter(Boolean).sort();
-      console.log('🔄 Fallback headmaster subjects:', list);
       setAvailableSubjects(list);
       setSubjectsLoading(false);
     }
@@ -613,11 +610,20 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
     }
   };
 
+  // Helper to clear cache when data changes
+  const clearCache = useCallback(() => {
+    setStudentsCache(new Map());
+    setMarksCache(new Map());
+  }, []);
+
   // Helper to reload exams list from backend and set local state
   const reloadExams = async () => {
     try {
       setIsLoading(true);
       setApiError('');
+      
+      // Clear cache when reloading exams to ensure fresh data
+      clearCache();
       
       // Determine role information
       const isClassTeacher = normalizedRoles.some(r => r.includes('class teacher') || r === 'classteacher');
@@ -649,51 +655,69 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
 
   // Use a stronger normalization that removes spaces and non-alphanumeric
   // characters so values like "6 A" and "6A" match reliably.
-  const normKey = (s) => (s || '').toString().toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, '');
+  const normKey = useCallback((s) => (s || '').toString().toLowerCase().replace(/\s+/g, '').replace(/[^a-z0-9]/g, ''), []);
 
-  // Filter exams based on user role and permissions
-  const examsForTeacher = exams.filter(ex => {
-    if (!user) return false;
+  // Memoize the expensive filtering logic for better performance
+  const examsForTeacher = useMemo(() => {
+    if (!user || !exams.length) return [];
     
-    // Use our normalized roles
+    // Pre-compute normalized user data
+    const userClassesNorm = user.classes ? new Set(user.classes.map(c => normKey(c))) : new Set();
+    const userSubjectsNorm = user.subjects ? new Set(user.subjects.map(s => normKey(s))) : new Set();
+    const userClassTeacherForNorm = user.classTeacherFor ? normKey(user.classTeacherFor) : '';
     
-    // Check for HM role, allowing for different formats (h m, hm, headmaster)
-    if (normalizedRoles.some(r => r.includes('h m') || r === 'hm' || r.includes('headmaster'))) return true;
-    
-    const exClass = normKey(ex.class);
-    const exSubject = normKey(ex.subject);
-    const teachesClass = user.classes && new Set(user.classes.map(c => normKey(c))).has(exClass);
-    const teachesSubject = user.subjects && new Set(user.subjects.map(s => normKey(s))).has(exSubject);
-    
-    // If user is a Class Teacher, allow access to:
-    // 1. Any subject from the class they are class teacher for
-    // 2. OR subjects they teach but only in classes they are assigned to teach
-    const isClassTeacher = normalizedRoles.some(r => r.includes('class teacher') || r === 'classteacher');
-    if (isClassTeacher) {
-      // Access to all subjects in the class they are class teacher for
-      const isClassTeacherForThisClass = user.classTeacherFor && normKey(user.classTeacherFor) === exClass;
+    return exams.filter(ex => {
+      // Check for HM role, allowing for different formats (h m, hm, headmaster)
+      if (normalizedRoles.some(r => r.includes('h m') || r === 'hm' || r.includes('headmaster'))) return true;
       
-      // Access to subjects they teach, but only in classes they are assigned to
-      const teachesThisSubjectInThisClass = teachesSubject && teachesClass;
+      const exClass = normKey(ex.class);
+      const exSubject = normKey(ex.subject);
+      const teachesClass = userClassesNorm.has(exClass);
+      const teachesSubject = userSubjectsNorm.has(exSubject);
       
-      return isClassTeacherForThisClass || teachesThisSubjectInThisClass;
-    }
-    
-    // Regular subject teacher: require both class and subject match.
-    return teachesClass && teachesSubject;
-  });
+      // If user is a Class Teacher, allow access to:
+      // 1. Any subject from the class they are class teacher for
+      // 2. OR subjects they teach but only in classes they are assigned to teach
+      const isClassTeacher = normalizedRoles.some(r => r.includes('class teacher') || r === 'classteacher');
+      if (isClassTeacher) {
+        // Access to all subjects in the class they are class teacher for
+        const isClassTeacherForThisClass = userClassTeacherForNorm && userClassTeacherForNorm === exClass;
+        
+        // Access to subjects they teach, but only in classes they are assigned to
+        const teachesThisSubjectInThisClass = teachesSubject && teachesClass;
+        
+        return isClassTeacherForThisClass || teachesThisSubjectInThisClass;
+      }
+      
+      // Regular subject teacher: require both class and subject match.
+      return teachesClass && teachesSubject;
+    });
+  }, [exams, user, normalizedRoles, normKey]);
 
-  // Open marks form for a specific exam
-  const openMarksForm = async (exam) => {
+  // Open marks form for a specific exam with caching optimization
+  const openMarksForm = useCallback(async (exam) => {
     setSelectedExam(exam);
     setIsLoading(true);
     setApiError('');
     
     try {
-      // Fetch students for this class
-      const students = await api.getStudents(exam.class);
-      // Fetch any existing marks for this exam
-      const marks = await api.getExamMarks(exam.examId);
+      // Check cache first to avoid duplicate API calls
+      const cacheKey = `${exam.class}_${exam.examId}`;
+      
+      let students = studentsCache.get(exam.class);
+      let marks = marksCache.get(exam.examId);
+      
+      // Fetch students only if not cached
+      if (!students) {
+        students = await api.getStudents(exam.class);
+        setStudentsCache(prev => new Map(prev.set(exam.class, students)));
+      }
+      
+      // Fetch marks only if not cached
+      if (!marks) {
+        marks = await api.getExamMarks(exam.examId);
+        setMarksCache(prev => new Map(prev.set(exam.examId, marks)));
+      }
       
       // Create marks rows for each student, pre-populating with existing marks
       const marksMap = {};
@@ -727,7 +751,7 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [studentsCache, marksCache]);
 
   // Open edit exam form
   const openEditExamForm = (exam) => {
@@ -799,16 +823,27 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
   };
   
   // View marks for a specific exam (read-only)
-  const viewMarks = async (exam) => {
+  const viewMarks = useCallback(async (exam) => {
     setSelectedExam(exam);
     setIsLoading(true);
     setApiError('');
     
     try {
-      // Fetch students for this class
-      const students = await api.getStudents(exam.class);
-      // Fetch existing marks for this exam
-      const marks = await api.getExamMarks(exam.examId);
+      // Use cache optimization here too
+      let students = studentsCache.get(exam.class);
+      let marks = marksCache.get(exam.examId);
+      
+      // Fetch students only if not cached
+      if (!students) {
+        students = await api.getStudents(exam.class);
+        setStudentsCache(prev => new Map(prev.set(exam.class, students)));
+      }
+      
+      // Fetch marks only if not cached
+      if (!marks) {
+        marks = await api.getExamMarks(exam.examId);
+        setMarksCache(prev => new Map(prev.set(exam.examId, marks)));
+      }
       
       // Create marks rows for each student with existing marks
       const marksMap = {};
@@ -842,7 +877,7 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [studentsCache, marksCache]);
 
   return (
     <div className="space-y-6">
@@ -1793,4 +1828,4 @@ const ExamManagement = ({ user, hasRole, withSubmit, setToast, userRolesNorm }) 
   }
 };
 
-export default ExamManagement;
+export default React.memo(ExamManagement);
